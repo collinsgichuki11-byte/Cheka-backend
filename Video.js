@@ -7,6 +7,7 @@ const VideoSchema = new mongoose.Schema({
   creator: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   creatorName: { type: String, required: true },
   likes: { type: Number, default: 0 },
+  likedBy: [{ type: String }],
   views: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }
 });

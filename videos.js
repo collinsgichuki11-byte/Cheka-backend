@@ -53,15 +53,21 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-// POST like a video
+// POST like/unlike a video
 router.post('/:id/like', async (req, res) => {
   try {
-    const video = await Video.findByIdAndUpdate(
-      req.params.id,
-      { $inc: { likes: 1 } },
-      { new: true }
-    );
-    res.json(video);
+    const { userId } = req.body;
+    const video = await Video.findById(req.params.id);
+    const alreadyLiked = video.likedBy.includes(userId);
+    if (alreadyLiked) {
+      video.likes = Math.max(0, video.likes - 1);
+      video.likedBy = video.likedBy.filter(id => id !== userId);
+    } else {
+      video.likes += 1;
+      video.likedBy.push(userId);
+    }
+    await video.save();
+    res.json({ likes: video.likes, liked: !alreadyLiked });
   } catch (err) {
     res.status(500).json({ msg: 'Server error' });
   }
