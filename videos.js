@@ -3,7 +3,6 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const Video = require('./Video');
 
-// Middleware to verify token
 const auth = (req, res, next) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ msg: 'No token' });
@@ -15,7 +14,6 @@ const auth = (req, res, next) => {
   }
 };
 
-// Helper to extract YouTube ID
 const getYoutubeId = (url) => {
   const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([^&\n?#]+)/);
   return match ? match[1] : null;
@@ -31,21 +29,16 @@ router.get('/', async (req, res) => {
   }
 });
 
-// POST submit a video
+// POST submit video
 router.post('/', auth, async (req, res) => {
   try {
     const { title, youtubeUrl, creatorName } = req.body;
     const youtubeId = getYoutubeId(youtubeUrl);
     if (!youtubeId) return res.status(400).json({ msg: 'Invalid YouTube URL' });
-
     const video = new Video({
-      title,
-      youtubeUrl,
-      youtubeId,
-      creator: req.user.id,
-      creatorName
+      title, youtubeUrl, youtubeId,
+      creator: req.user.id, creatorName
     });
-
     await video.save();
     res.json(video);
   } catch (err) {
@@ -53,7 +46,7 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-// POST like/unlike a video
+// POST like/unlike
 router.post('/:id/like', async (req, res) => {
   try {
     const { userId } = req.body;
@@ -68,6 +61,35 @@ router.post('/:id/like', async (req, res) => {
     }
     await video.save();
     res.json({ likes: video.likes, liked: !alreadyLiked });
+  } catch (err) {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// POST increment view count
+router.post('/:id/view', async (req, res) => {
+  try {
+    const video = await Video.findByIdAndUpdate(
+      req.params.id,
+      { $inc: { views: 1 } },
+      { new: true }
+    );
+    res.json({ views: video.views });
+  } catch (err) {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// DELETE video (only by creator)
+router.delete('/:id', auth, async (req, res) => {
+  try {
+    const video = await Video.findById(req.params.id);
+    if (!video) return res.status(404).json({ msg: 'Video not found' });
+    if (video.creator.toString() !== req.user.id) {
+      return res.status(401).json({ msg: 'Not authorized' });
+    }
+    await video.deleteOne();
+    res.json({ msg: 'Video deleted' });
   } catch (err) {
     res.status(500).json({ msg: 'Server error' });
   }
