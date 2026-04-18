@@ -5,7 +5,6 @@ const connectDB = require('./db');
 const authRoutes = require('./auth');
 const videoRoutes = require('./videos');
 const commentRoutes = require('./comments');
-const commentRoutes = require('./comments');
 
 dotenv.config();
 connectDB();
@@ -21,7 +20,6 @@ app.get('/', (req, res) => {
 
 app.use('/api/auth', authRoutes);
 app.use('/api/videos', videoRoutes);
-app.use('/api/comments', commentRoutes);
 app.use('/api/comments', commentRoutes);
 
 const PORT = process.env.PORT || 5000;
