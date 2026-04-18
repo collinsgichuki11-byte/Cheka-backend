@@ -19,10 +19,11 @@ const getYoutubeId = (url) => {
   return match ? match[1] : null;
 };
 
-// GET all videos
+// GET all videos with optional category filter
 router.get('/', async (req, res) => {
   try {
-    const videos = await Video.find().sort({ createdAt: -1 });
+    const filter = req.query.category ? { category: req.query.category } : {};
+    const videos = await Video.find(filter).sort({ createdAt: -1 });
     res.json(videos);
   } catch (err) {
     res.status(500).json({ msg: 'Server error' });
@@ -90,6 +91,19 @@ router.delete('/:id', auth, async (req, res) => {
     }
     await video.deleteOne();
     res.json({ msg: 'Video deleted' });
+  } catch (err) {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET trending videos (most liked this week)
+router.get('/trending', async (req, res) => {
+  try {
+    const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const videos = await Video.find({ createdAt: { $gte: oneWeekAgo } })
+      .sort({ likes: -1 })
+      .limit(10);
+    res.json(videos);
   } catch (err) {
     res.status(500).json({ msg: 'Server error' });
   }

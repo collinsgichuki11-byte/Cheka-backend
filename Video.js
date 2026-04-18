@@ -8,6 +8,7 @@ const VideoSchema = new mongoose.Schema({
   creatorName: { type: String, required: true },
   likes: { type: Number, default: 0 },
   likedBy: [{ type: String }],
+  category: { type: String, default: "General", enum: ["General","Comedy","Skits","Memes","Roasts","Standup"] },
   views: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }
 });
