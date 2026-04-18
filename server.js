@@ -3,6 +3,7 @@ const cors = require('cors');
 const dotenv = require('dotenv');
 const connectDB = require('./db');
 const authRoutes = require('./auth');
+const videoRoutes = require('./videos');
 
 dotenv.config();
 connectDB();
@@ -17,6 +18,7 @@ app.get('/', (req, res) => {
 });
 
 app.use('/api/auth', authRoutes);
+app.use('/api/videos', videoRoutes);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Cheka server running on port ${PORT}`));
