@@ -2,8 +2,8 @@ const mongoose = require('mongoose');
 
 const VideoSchema = new mongoose.Schema({
   title: { type: String, required: true },
-  youtubeUrl: { type: String, required: true },
-  youtubeId: { type: String, default: '' },
+  youtubeUrl: { type: String, default: '' },
+  youtubeId: { type: String, default: '', required: false },
   videoUrl: { type: String, default: '' },
   videoType: { type: String, enum: ['youtube','direct'], default: 'youtube' },
   creator: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
