@@ -6,6 +6,7 @@ const authRoutes = require('./auth');
 const videoRoutes = require('./videos');
 const commentRoutes = require('./comments');
 const notifRoutes = require('./notifications');
+const uploadRoutes = require('./upload');
 
 dotenv.config();
 connectDB();
@@ -23,6 +24,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/videos', videoRoutes);
 app.use('/api/comments', commentRoutes);
 app.use('/api/notifications', notifRoutes);
+app.use('/api/upload', uploadRoutes);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Cheka server running on port ${PORT}`));

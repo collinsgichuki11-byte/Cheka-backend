@@ -33,12 +33,18 @@ router.get('/', async (req, res) => {
 // POST submit video
 router.post('/', auth, async (req, res) => {
   try {
-    const { title, youtubeUrl, creatorName } = req.body;
+    const { title, youtubeUrl, creatorName, videoUrl, category } = req.body;
     const youtubeId = getYoutubeId(youtubeUrl);
-    if (!youtubeId) return res.status(400).json({ msg: 'Invalid YouTube URL' });
+    if (!youtubeId && !videoUrl) return res.status(400).json({ msg: 'Please provide a YouTube URL or upload a video' });
     const video = new Video({
-      title, youtubeUrl, youtubeId,
-      creator: req.user.id, creatorName
+      title,
+      youtubeUrl: youtubeUrl || '',
+      youtubeId: youtubeId || '',
+      videoUrl: videoUrl || '',
+      videoType: videoUrl ? 'direct' : 'youtube',
+      creator: req.user.id,
+      creatorName,
+      category
     });
     await video.save();
     res.json(video);
