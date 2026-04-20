@@ -102,14 +102,23 @@ router.delete('/:id', auth, async (req, res) => {
   }
 });
 
-// GET trending videos (most liked this week)
-router.get('/trending', async (req, res) => {
+// GET trending videos - smart algorithm
+router.get("/trending", async (req, res) => {
   try {
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const videos = await Video.find({ createdAt: { $gte: oneWeekAgo } })
-      .sort({ likes: -1 })
-      .limit(10);
-    res.json(videos);
+    const videos = await Video.find({ createdAt: { $gte: oneWeekAgo } });
+    
+    // Score = likes*3 + views*1 + recency bonus
+    const scored = videos.map(v => {
+      const ageHours = (Date.now() - new Date(v.createdAt)) / 3600000;
+      const recencyBonus = ageHours < 24 ? 50 : ageHours < 48 ? 20 : 0;
+      const score = (v.likes * 3) + (v.views * 1) + recencyBonus;
+      return { ...v.toObject(), score };
+    });
+
+    scored.sort((a, b) => b.score - a.score);
+    res.json(scored.slice(0, 10));
   } catch (err) {
     res.status(500).json({ msg: 'Server error' });
   }
