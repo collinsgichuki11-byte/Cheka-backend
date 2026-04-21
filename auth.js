@@ -3,60 +3,63 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const User = require('./User');
+const Analytics = require('./Analytics');
 
-// ============================================
-// Hardcoded owner — auto-promoted to admin on every login/signup
-// ============================================
-const OWNER_EMAIL = 'youanadanielle@gmail.com';
+const trackEvent = (type, data) => {
+  Analytics.create({ type, ...data }).catch(() => {});
+};
 
-// Basic input validation
-function validateEmail(email) {
-  return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
+const userPayload = (user) => ({
+  id: user._id,
+  username: user.username,
+  email: user.email,
+  isAdmin: user.isAdmin,
+  isVerified: user.isVerified,
+  monetizationEnabled: user.monetizationEnabled,
+  monetizationStatus: user.monetizationStatus,
+  totalEarnings: user.totalEarnings,
+  earningsBalance: user.earningsBalance
+});
 
 // SIGNUP
 router.post('/signup', async (req, res) => {
   try {
-    let { username, email, password } = req.body;
+    let { username, email, password } = req.body || {};
+    username = (username || '').trim();
+    email = (email || '').trim().toLowerCase();
+    password = password || '';
 
-    // Validation
-    if (!username || !email || !password) return res.status(400).json({ msg: 'All fields are required' });
-    username = String(username).trim();
-    email = String(email).trim().toLowerCase();
-    if (username.length < 3 || username.length > 24) return res.status(400).json({ msg: 'Username must be 3–24 characters' });
-    if (!/^[a-zA-Z0-9_]+$/.test(username)) return res.status(400).json({ msg: 'Username can only contain letters, numbers, and underscores' });
-    if (!validateEmail(email)) return res.status(400).json({ msg: 'Please enter a valid email address' });
-    if (password.length < 6) return res.status(400).json({ msg: 'Password must be at least 6 characters' });
-    if (password.length > 200) return res.status(400).json({ msg: 'Password too long' });
-
-    // Check if user exists (email OR username)
-    const existing = await User.findOne({ $or: [{ email }, { username }] });
-    if (existing) {
-      const field = existing.email === email ? 'Email' : 'Username';
-      return res.status(400).json({ msg: `${field} is already taken` });
+    if (!username || username.length < 3 || username.length > 24) {
+      return res.status(400).json({ msg: 'Username must be 3–24 characters' });
+    }
+    if (!/^[a-zA-Z0-9_]+$/.test(username)) {
+      return res.status(400).json({ msg: 'Username can only contain letters, numbers, _' });
+    }
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ msg: 'Invalid email' });
+    }
+    if (!password || password.length < 6) {
+      return res.status(400).json({ msg: 'Password must be at least 6 characters' });
     }
 
-    // Hash password
+    const existing = await User.findOne({ $or: [{ email }, { username }] });
+    if (existing) return res.status(400).json({ msg: 'User already exists' });
+
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    // Auto-promote the owner email to admin on signup
-    const isAdmin = email === OWNER_EMAIL;
+    const userCount = await User.countDocuments();
+    const adminEmails = (process.env.ADMIN_EMAILS || '')
+      .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
+    const isAdmin = userCount === 0 || adminEmails.includes(email);
 
-    // Create user
-    const user = new User({ username, email, password: hashedPassword, isAdmin });
+    const user = new User({ username, email, password: hashedPassword, isAdmin, isVerified: isAdmin });
     await user.save();
 
-    // Create token
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-
-    res.json({
-      token,
-      user: { id: user._id, username: user.username, email: user.email, isAdmin: user.isAdmin }
-    });
-
+    trackEvent('signup', { user: user._id });
+    res.json({ token, user: userPayload(user) });
   } catch (err) {
-    console.error('Signup error:', err.message);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -64,9 +67,10 @@ router.post('/signup', async (req, res) => {
 // LOGIN
 router.post('/login', async (req, res) => {
   try {
-    let { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ msg: 'Email and password are required' });
-    email = String(email).trim().toLowerCase();
+    let { email, password } = req.body || {};
+    email = (email || '').trim().toLowerCase();
+    password = password || '';
+    if (!email || !password) return res.status(400).json({ msg: 'Missing credentials' });
 
     const user = await User.findOne({ email });
     if (!user) return res.status(400).json({ msg: 'Invalid credentials' });
@@ -74,26 +78,17 @@ router.post('/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ msg: 'Invalid credentials' });
 
-    // Auto-promote owner email to admin on every login (defense in depth)
-    if (email === OWNER_EMAIL && !user.isAdmin) {
+    const hasAdmin = await User.exists({ isAdmin: true });
+    if (!hasAdmin) {
       user.isAdmin = true;
-      await user.save();
-    }
-    // Defense: demote anyone else who somehow has isAdmin=true
-    if (email !== OWNER_EMAIL && user.isAdmin) {
-      user.isAdmin = false;
+      user.isVerified = true;
       await user.save();
     }
 
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-
-    res.json({
-      token,
-      user: { id: user._id, username: user.username, email: user.email, isAdmin: user.isAdmin }
-    });
-
+    trackEvent('login', { user: user._id });
+    res.json({ token, user: userPayload(user) });
   } catch (err) {
-    console.error('Login error:', err.message);
     res.status(500).json({ msg: 'Server error' });
   }
 });

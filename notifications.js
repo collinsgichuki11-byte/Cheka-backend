@@ -14,17 +14,26 @@ const auth = (req, res, next) => {
 router.get('/', auth, async (req, res) => {
   try {
     const notifs = await Notification.find({ recipient: req.user.id })
-      .sort({ createdAt: -1 }).limit(20);
+      .sort({ createdAt: -1 }).limit(50);
     res.json(notifs);
   } catch { res.status(500).json({ msg: 'Server error' }); }
 });
 
-// POST create notification
-router.post('/', async (req, res) => {
+// POST create notification — sender forced to authed user
+router.post('/', auth, async (req, res) => {
   try {
-    const { recipient, sender, type, videoTitle, videoId } = req.body;
-    if (recipient === sender) return res.json({ msg: 'No self notify' });
-    const notif = new Notification({ recipient, sender, type, videoTitle, videoId });
+    const { recipient, type, videoTitle, videoId } = req.body;
+    if (!recipient || !type || !videoTitle || !videoId) {
+      return res.status(400).json({ msg: 'Missing fields' });
+    }
+    if (recipient === req.user.id) return res.json({ msg: 'No self notify' });
+    const notif = new Notification({
+      recipient,
+      sender: req.user.id,
+      type,
+      videoTitle: String(videoTitle).slice(0, 200),
+      videoId: String(videoId)
+    });
     await notif.save();
     res.json(notif);
   } catch { res.status(500).json({ msg: 'Server error' }); }

@@ -7,12 +7,12 @@ const UserSchema = new mongoose.Schema({
   isCreator: { type: Boolean, default: false },
   isAdmin: { type: Boolean, default: false },
   isVerified: { type: Boolean, default: false },
+  displayName: { type: String, default: '' },
+  bio: { type: String, default: '', maxlength: 160 },
   monetizationEnabled: { type: Boolean, default: false },
-  monetizationStatus: { type: String, default: 'inactive' }, // inactive | pending | active | suspended
+  monetizationStatus: { type: String, enum: ['off', 'pending', 'active', 'paused'], default: 'off' },
+  earningsBalance: { type: Number, default: 0 },
   totalEarnings: { type: Number, default: 0 },
-  strikes: { type: Number, default: 0 },
-  bio: { type: String, default: '' },
-  avatar: { type: String, default: '' },
   createdAt: { type: Date, default: Date.now }
 });
 

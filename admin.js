@@ -1,163 +1,113 @@
 const express = require('express');
-const router = express.Router();
 const jwt = require('jsonwebtoken');
 const User = require('./User');
 const Video = require('./Video');
-const Settings = require('./Settings');
+const PlatformSettings = require('./PlatformSettings');
 
-// ============================================
-// HARDCODED OWNER — only this email can ever be admin
-// ============================================
-const OWNER_EMAIL = 'youanadanielle@gmail.com';
+const router = express.Router();
 
 const auth = (req, res, next) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ msg: 'No token' });
-  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
-  catch { res.status(401).json({ msg: 'Invalid token' }); }
-};
-
-// Strict admin check — must be logged in AND email must match owner
-const adminAuth = (req, res, next) => {
-  auth(req, res, async () => {
-    try {
-      const user = await User.findById(req.user.id);
-      if (!user || (user.email || '').toLowerCase() !== OWNER_EMAIL) {
-        return res.status(403).json({ msg: 'Not authorized' });
-      }
-      // Auto-promote owner email to isAdmin if not already
-      if (!user.isAdmin) {
-        user.isAdmin = true;
-        await user.save();
-      }
-      req.adminUser = user;
-      next();
-    } catch { res.status(500).json({ msg: 'Server error' }); }
-  });
-};
-
-async function getSettings() {
-  let s = await Settings.findOne({ key: 'platform' });
-  if (!s) s = await Settings.create({ key: 'platform' });
-  return s;
-}
-
-// GET combined dashboard: stats + settings + users
-router.get('/dashboard', adminAuth, async (req, res) => {
   try {
-    const [users, videos, settings] = await Promise.all([
-      User.find().select('-password').sort({ createdAt: -1 }),
-      Video.countDocuments(),
-      getSettings()
-    ]);
-    const verified = users.filter(u => u.isVerified).length;
-    const monetizedCreators = users.filter(u => u.monetizationEnabled).length;
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ msg: 'Invalid token' });
+  }
+};
+
+const getSettings = async () => {
+  let settings = await PlatformSettings.findOne({ key: 'main' });
+  if (!settings) settings = await PlatformSettings.create({ key: 'main' });
+  return settings;
+};
+
+const adminOnly = async (req, res, next) => {
+  const user = await User.findById(req.user.id);
+  if (!user || !user.isAdmin) return res.status(403).json({ msg: 'Admin only' });
+  req.admin = user;
+  next();
+};
+
+router.get('/ads', async (req, res) => {
+  try {
+    const settings = await getSettings();
     res.json({
-      stats: { users: users.length, videos, verified, monetizedCreators },
-      settings,
-      users
+      adsEnabled: settings.adsEnabled,
+      adTitle: settings.adTitle,
+      adBody: settings.adBody,
+      adCta: settings.adCta,
+      adUrl: settings.adUrl
     });
-  } catch (err) {
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
 
-// GET public ad settings (used by feed) — no auth needed, but read-only
-router.get('/ads', async (req, res) => {
+router.get('/dashboard', auth, adminOnly, async (req, res) => {
   try {
-    const s = await getSettings();
-    // Strip internal fields
+    const [settings, users, videoCount] = await Promise.all([
+      getSettings(),
+      User.find().sort({ createdAt: -1 }).select('-password').limit(100),
+      Video.countDocuments()
+    ]);
     res.json({
-      adsEnabled: s.adsEnabled,
-      monetizationEnabled: s.monetizationEnabled,
-      adTitle: s.adTitle,
-      adBody: s.adBody,
-      adCta: s.adCta,
-      adUrl: s.adUrl
+      settings,
+      users,
+      stats: {
+        users: users.length,
+        videos: videoCount,
+        verified: users.filter(u => u.isVerified).length,
+        monetizedCreators: users.filter(u => u.monetizationEnabled).length
+      }
     });
-  } catch { res.status(500).json({ msg: 'Server error' }); }
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
 });
 
-// PATCH ad/monetization settings
-router.patch('/ads', adminAuth, async (req, res) => {
+router.patch('/ads', auth, adminOnly, async (req, res) => {
   try {
-    const allowed = ['adsEnabled', 'monetizationEnabled', 'adTitle', 'adBody', 'adCta', 'adUrl', 'platformCpm'];
-    const update = {};
-    for (const k of allowed) if (k in req.body) update[k] = req.body[k];
-    update.updatedAt = new Date();
-    const s = await Settings.findOneAndUpdate(
-      { key: 'platform' },
+    const { adsEnabled, monetizationEnabled, platformCpm, adTitle, adBody, adCta, adUrl } = req.body;
+    const update = { updatedAt: new Date() };
+    if (adsEnabled !== undefined) update.adsEnabled = !!adsEnabled;
+    if (monetizationEnabled !== undefined) update.monetizationEnabled = !!monetizationEnabled;
+    if (platformCpm !== undefined) update.platformCpm = Math.max(0, Number(platformCpm) || 0);
+    if (adTitle !== undefined) update.adTitle = String(adTitle).trim().slice(0, 80);
+    if (adBody !== undefined) update.adBody = String(adBody).trim().slice(0, 180);
+    if (adCta !== undefined) update.adCta = String(adCta).trim().slice(0, 40);
+    if (adUrl !== undefined) update.adUrl = String(adUrl).trim().slice(0, 300);
+
+    const settings = await PlatformSettings.findOneAndUpdate(
+      { key: 'main' },
       { $set: update },
       { new: true, upsert: true }
     );
-    res.json(s);
-  } catch { res.status(500).json({ msg: 'Server error' }); }
+    res.json(settings);
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
 });
 
-// PATCH update any user fields (admin)
-router.patch('/users/:id', adminAuth, async (req, res) => {
+router.patch('/users/:id', auth, adminOnly, async (req, res) => {
   try {
-    // CRITICAL: never allow promoting another user to admin via API
-    const allowed = ['isVerified', 'monetizationEnabled', 'monetizationStatus', 'totalEarnings', 'strikes'];
+    const { isVerified, monetizationEnabled, monetizationStatus, isAdmin } = req.body;
     const update = {};
-    for (const k of allowed) if (k in req.body) update[k] = req.body[k];
+    if (isVerified !== undefined) update.isVerified = !!isVerified;
+    if (monetizationEnabled !== undefined) update.monetizationEnabled = !!monetizationEnabled;
+    if (monetizationStatus !== undefined) update.monetizationStatus = monetizationStatus;
+    if (isAdmin !== undefined && req.params.id !== req.user.id) update.isAdmin = !!isAdmin;
+
+    if (update.monetizationEnabled === true && !update.monetizationStatus) update.monetizationStatus = 'active';
+    if (update.monetizationEnabled === false && !update.monetizationStatus) update.monetizationStatus = 'off';
+
     const user = await User.findByIdAndUpdate(req.params.id, { $set: update }, { new: true }).select('-password');
     if (!user) return res.status(404).json({ msg: 'User not found' });
     res.json(user);
-  } catch { res.status(500).json({ msg: 'Server error' }); }
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
 });
-
-// GET all users
-router.get('/users', adminAuth, async (req, res) => {
-  try {
-    const users = await User.find().select('-password').sort({ createdAt: -1 });
-    res.json(users);
-  } catch { res.status(500).json({ msg: 'Server error' }); }
-});
-
-// GET all videos
-router.get('/videos', adminAuth, async (req, res) => {
-  try {
-    const videos = await Video.find().sort({ createdAt: -1 });
-    res.json(videos);
-  } catch { res.status(500).json({ msg: 'Server error' }); }
-});
-
-// DELETE a video (admin can delete any)
-router.delete('/videos/:id', adminAuth, async (req, res) => {
-  try {
-    await Video.findByIdAndDelete(req.params.id);
-    res.json({ msg: 'Video deleted' });
-  } catch { res.status(500).json({ msg: 'Server error' }); }
-});
-
-// Legacy verify routes
-router.put('/users/:id/verify', adminAuth, async (req, res) => {
-  try {
-    const user = await User.findByIdAndUpdate(req.params.id, { isVerified: true }, { new: true }).select('-password');
-    res.json(user);
-  } catch { res.status(500).json({ msg: 'Server error' }); }
-});
-
-router.put('/users/:id/unverify', adminAuth, async (req, res) => {
-  try {
-    const user = await User.findByIdAndUpdate(req.params.id, { isVerified: false }, { new: true }).select('-password');
-    res.json(user);
-  } catch { res.status(500).json({ msg: 'Server error' }); }
-});
-
-router.put('/users/:id/monetize', adminAuth, async (req, res) => {
-  try {
-    const user = await User.findByIdAndUpdate(
-      req.params.id,
-      { monetizationEnabled: true, monetizationStatus: 'active' },
-      { new: true }
-    ).select('-password');
-    res.json(user);
-  } catch { res.status(500).json({ msg: 'Server error' }); }
-});
-
-// REMOVED: /users/:id/makeadmin — security risk. Only OWNER_EMAIL can be admin.
 
 module.exports = router;
-module.exports.OWNER_EMAIL = OWNER_EMAIL;
