@@ -5,6 +5,11 @@ const User = require('./User');
 const Video = require('./Video');
 const Settings = require('./Settings');
 
+// ============================================
+// HARDCODED OWNER — only this email can ever be admin
+// ============================================
+const OWNER_EMAIL = 'youanadanielle@gmail.com';
+
 const auth = (req, res, next) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ msg: 'No token' });
@@ -12,11 +17,20 @@ const auth = (req, res, next) => {
   catch { res.status(401).json({ msg: 'Invalid token' }); }
 };
 
+// Strict admin check — must be logged in AND email must match owner
 const adminAuth = (req, res, next) => {
   auth(req, res, async () => {
     try {
       const user = await User.findById(req.user.id);
-      if (!user?.isAdmin) return res.status(403).json({ msg: 'Not authorized' });
+      if (!user || (user.email || '').toLowerCase() !== OWNER_EMAIL) {
+        return res.status(403).json({ msg: 'Not authorized' });
+      }
+      // Auto-promote owner email to isAdmin if not already
+      if (!user.isAdmin) {
+        user.isAdmin = true;
+        await user.save();
+      }
+      req.adminUser = user;
       next();
     } catch { res.status(500).json({ msg: 'Server error' }); }
   });
@@ -48,11 +62,19 @@ router.get('/dashboard', adminAuth, async (req, res) => {
   }
 });
 
-// GET public ad settings (used by feed)
+// GET public ad settings (used by feed) — no auth needed, but read-only
 router.get('/ads', async (req, res) => {
   try {
     const s = await getSettings();
-    res.json(s);
+    // Strip internal fields
+    res.json({
+      adsEnabled: s.adsEnabled,
+      monetizationEnabled: s.monetizationEnabled,
+      adTitle: s.adTitle,
+      adBody: s.adBody,
+      adCta: s.adCta,
+      adUrl: s.adUrl
+    });
   } catch { res.status(500).json({ msg: 'Server error' }); }
 });
 
@@ -75,7 +97,8 @@ router.patch('/ads', adminAuth, async (req, res) => {
 // PATCH update any user fields (admin)
 router.patch('/users/:id', adminAuth, async (req, res) => {
   try {
-    const allowed = ['isVerified', 'isAdmin', 'monetizationEnabled', 'monetizationStatus', 'totalEarnings'];
+    // CRITICAL: never allow promoting another user to admin via API
+    const allowed = ['isVerified', 'monetizationEnabled', 'monetizationStatus', 'totalEarnings', 'strikes'];
     const update = {};
     for (const k of allowed) if (k in req.body) update[k] = req.body[k];
     const user = await User.findByIdAndUpdate(req.params.id, { $set: update }, { new: true }).select('-password');
@@ -100,7 +123,7 @@ router.get('/videos', adminAuth, async (req, res) => {
   } catch { res.status(500).json({ msg: 'Server error' }); }
 });
 
-// DELETE a video
+// DELETE a video (admin can delete any)
 router.delete('/videos/:id', adminAuth, async (req, res) => {
   try {
     await Video.findByIdAndDelete(req.params.id);
@@ -108,7 +131,7 @@ router.delete('/videos/:id', adminAuth, async (req, res) => {
   } catch { res.status(500).json({ msg: 'Server error' }); }
 });
 
-// Legacy routes (kept for backward compatibility)
+// Legacy verify routes
 router.put('/users/:id/verify', adminAuth, async (req, res) => {
   try {
     const user = await User.findByIdAndUpdate(req.params.id, { isVerified: true }, { new: true }).select('-password');
@@ -134,11 +157,7 @@ router.put('/users/:id/monetize', adminAuth, async (req, res) => {
   } catch { res.status(500).json({ msg: 'Server error' }); }
 });
 
-router.put('/users/:id/makeadmin', adminAuth, async (req, res) => {
-  try {
-    const user = await User.findByIdAndUpdate(req.params.id, { isAdmin: true }, { new: true }).select('-password');
-    res.json(user);
-  } catch { res.status(500).json({ msg: 'Server error' }); }
-});
+// REMOVED: /users/:id/makeadmin — security risk. Only OWNER_EMAIL can be admin.
 
 module.exports = router;
+module.exports.OWNER_EMAIL = OWNER_EMAIL;
