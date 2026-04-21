@@ -15,6 +15,15 @@ const auth = (req, res, next) => {
   }
 };
 
+// Optional auth — sets req.user if token present, but doesn't block
+const optionalAuth = (req, res, next) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (token) {
+    try { req.user = jwt.verify(token, process.env.JWT_SECRET); } catch {}
+  }
+  next();
+};
+
 const getYoutubeId = (url) => {
   if (!url) return null;
   const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([^&\n?#]+)/);
@@ -50,7 +59,6 @@ router.get('/', async (req, res) => {
   try {
     const filter = req.query.category ? { category: req.query.category } : {};
     let videos = await Video.find(filter).sort({ createdAt: -1 });
-    // Skip broken records — direct must have a real videoUrl, youtube must have an id
     videos = videos.filter(v =>
       (v.videoType === 'direct' && /^https:\/\//.test(v.videoUrl || '')) ||
       (v.videoType === 'youtube' && v.youtubeId && v.youtubeId.length > 3)
@@ -62,7 +70,7 @@ router.get('/', async (req, res) => {
   }
 });
 
-// POST submit video
+// POST submit video — requires auth
 router.post('/', auth, async (req, res) => {
   try {
     const { title, youtubeUrl, creatorName, videoUrl, category, enterBattle } = req.body;
@@ -70,6 +78,7 @@ router.post('/', auth, async (req, res) => {
     if (!title || !title.trim()) return res.status(400).json({ msg: 'Title is required' });
     if (!creatorName || !creatorName.trim()) return res.status(400).json({ msg: 'Creator name missing — please log in again' });
 
+    const trimmedTitle = String(title).trim().slice(0, 200);
     const trimmedVideoUrl = (videoUrl || '').trim();
     const trimmedYoutubeUrl = (youtubeUrl || '').trim();
     const youtubeId = getYoutubeId(trimmedYoutubeUrl);
@@ -97,15 +106,18 @@ router.post('/', auth, async (req, res) => {
       if (todayPrompt) promptDate = today;
     }
 
+    const allowedCategories = ['General','Comedy','Skits','Memes','Roasts','Standup'];
+    const safeCategory = allowedCategories.includes(category) ? category : 'General';
+
     const video = new Video({
-      title: title.trim(),
+      title: trimmedTitle,
       youtubeUrl: finalYoutubeUrl,
       youtubeId: finalYoutubeId,
       videoUrl: finalVideoUrl,
       videoType,
       creator: req.user.id,
-      creatorName: creatorName.trim(),
-      category: category || 'General',
+      creatorName: String(creatorName).trim().slice(0, 30),
+      category: safeCategory,
       promptDate
     });
     await video.save();
@@ -116,10 +128,10 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-// POST like/unlike
-router.post('/:id/like', async (req, res) => {
+// POST like/unlike — REQUIRES auth, uses token user ID (not body)
+router.post('/:id/like', auth, async (req, res) => {
   try {
-    const { userId } = req.body;
+    const userId = req.user.id; // from token, NOT body — secure
     const video = await Video.findById(req.params.id);
     if (!video) return res.status(404).json({ msg: 'Video not found' });
     const alreadyLiked = video.likedBy.includes(userId);
@@ -137,9 +149,24 @@ router.post('/:id/like', async (req, res) => {
   }
 });
 
-// POST increment view count
+// POST increment view count — public but rate-limited per IP via simple in-memory map
+const viewCache = new Map();
 router.post('/:id/view', async (req, res) => {
   try {
+    const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+    const key = `${ip}:${req.params.id}`;
+    const now = Date.now();
+    const last = viewCache.get(key);
+    // Throttle: same IP can't bump views for the same video more than once per 5 minutes
+    if (last && now - last < 5 * 60 * 1000) {
+      const v = await Video.findById(req.params.id).select('views');
+      return res.json({ views: v?.views || 0 });
+    }
+    viewCache.set(key, now);
+    // Cleanup old entries every ~100 calls
+    if (viewCache.size > 5000) {
+      for (const [k, t] of viewCache) if (now - t > 10 * 60 * 1000) viewCache.delete(k);
+    }
     const video = await Video.findByIdAndUpdate(
       req.params.id,
       { $inc: { views: 1 } },
