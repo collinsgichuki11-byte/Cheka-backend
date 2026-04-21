@@ -26,8 +26,15 @@ const VERBS = {
   message: 'sent you a message'
 };
 
+// Track newness across the save() lifecycle so post('save') only fires for inserts.
+NotificationSchema.pre('save', function (next) {
+  this.$locals.wasNew = this.isNew;
+  next();
+});
+
 // Post-save hook: fire web push to the recipient on every new notification.
 NotificationSchema.post('save', async function (doc) {
+  if (!doc.$locals?.wasNew) return; // skip updates (e.g. mark-as-read)
   try {
     const User = require('./User');
     const { sendPushTo } = require('./webpush');

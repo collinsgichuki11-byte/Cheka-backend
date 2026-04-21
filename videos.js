@@ -77,14 +77,24 @@ const POPULATE_CREATOR = 'username displayName isVerified monetizationEnabled mo
 // Hide private videos from anonymous viewers and from users who are not the owner.
 const visibilityFilter = (req) => {
   const me = req.user?.id;
-  // Always hide drafts. Hide scheduled posts whose publishAt is in the future.
-  const publishedClause = {
+  // Combine published + privacy clauses with $and so neither $or wipes the other.
+  const publishedOr = [
+    { publishAt: null },
+    { publishAt: { $exists: false } },
+    { publishAt: { $lte: new Date() } }
+  ];
+  if (!me) {
+    return { isDraft: { $ne: true }, isPrivate: { $ne: true }, $or: publishedOr };
+  }
+  // Owner can see their own private posts in mixed feeds; drafts/scheduled stay
+  // hidden from feeds and only surface through /drafts/me and /scheduled/me.
+  return {
     isDraft: { $ne: true },
-    $or: [{ publishAt: null }, { publishAt: { $exists: false } }, { publishAt: { $lte: new Date() } }]
+    $and: [
+      { $or: publishedOr },
+      { $or: [{ isPrivate: { $ne: true } }, { creator: me }] }
+    ]
   };
-  if (!me) return { isPrivate: { $ne: true }, ...publishedClause };
-  // Owner can always see their own private/draft/scheduled stuff via dedicated endpoints.
-  return { ...publishedClause, $or: [{ isPrivate: { $ne: true } }, { creator: me }] };
 };
 
 // GET all videos — smart "For You" feed
@@ -314,11 +324,22 @@ router.post('/', auth, async (req, res) => {
     const youtubeId = getYoutubeId(youtubeUrl);
     if (!youtubeId && !videoUrl) return res.status(400).json({ msg: 'Please provide a YouTube URL or upload a video' });
 
+    const isObjId = (v) => typeof v === 'string' && /^[a-f\d]{24}$/i.test(v);
+
     let remixOfId = null;
     if (remixOf) {
+      if (!isObjId(remixOf)) return res.status(400).json({ msg: 'Invalid remix reference' });
       const original = await Video.findById(remixOf).select('_id creator title');
       if (!original) return res.status(400).json({ msg: 'Original video for remix not found' });
       remixOfId = original._id;
+    }
+
+    let audioOfId = null;
+    if (audioOf) {
+      if (!isObjId(audioOf)) return res.status(400).json({ msg: 'Invalid sound reference' });
+      const sound = await Video.findById(audioOf).select('_id');
+      if (!sound) return res.status(400).json({ msg: 'Sound not found' });
+      audioOfId = sound._id;
     }
 
     const creator = await User.findById(req.user.id).select('username displayName notifyOnRemix');
@@ -361,7 +382,7 @@ router.post('/', auth, async (req, res) => {
       isDraft: !!isDraft,
       publishAt: scheduledAt,
       isDuet: !!isDuet,
-      audioOf: audioOf || null,
+      audioOf: audioOfId,
       chapters: safeChapters,
       hashtags: extractHashtags(cleanTitle, cleanCaption),
       remixOf: remixOfId
