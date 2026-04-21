@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const Video = require('./Video');
+const Prompt = require('./Prompt');
 
 const auth = (req, res, next) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
@@ -19,6 +20,28 @@ const getYoutubeId = (url) => {
   return match ? match[1] : null;
 };
 
+function nairobiToday() {
+  return new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Nairobi' });
+}
+
+// GET trending videos - smart algorithm (must come before / GET to avoid conflicts? Express handles fine)
+router.get("/trending", async (req, res) => {
+  try {
+    const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const videos = await Video.find({ createdAt: { $gte: oneWeekAgo } });
+    const scored = videos.map(v => {
+      const ageHours = (Date.now() - new Date(v.createdAt)) / 3600000;
+      const recencyBonus = ageHours < 24 ? 50 : ageHours < 48 ? 20 : 0;
+      const score = (v.likes * 3) + (v.views * 1) + recencyBonus;
+      return { ...v.toObject(), score };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    res.json(scored.slice(0, 10));
+  } catch (err) {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
 // GET all videos with optional category filter
 router.get('/', async (req, res) => {
   try {
@@ -33,9 +56,17 @@ router.get('/', async (req, res) => {
 // POST submit video
 router.post('/', auth, async (req, res) => {
   try {
-    const { title, youtubeUrl, creatorName, videoUrl, category } = req.body;
-    const youtubeId = getYoutubeId(youtubeUrl);
+    const { title, youtubeUrl, creatorName, videoUrl, category, enterBattle } = req.body;
+    const youtubeId = getYoutubeId(youtubeUrl || '');
     if (!youtubeId && !videoUrl) return res.status(400).json({ msg: 'Please provide a YouTube URL or upload a video' });
+
+    let promptDate = '';
+    if (enterBattle) {
+      const today = nairobiToday();
+      const todayPrompt = await Prompt.findOne({ date: today });
+      if (todayPrompt) promptDate = today;
+    }
+
     const video = new Video({
       title,
       youtubeUrl: youtubeUrl || '',
@@ -44,7 +75,8 @@ router.post('/', auth, async (req, res) => {
       videoType: videoUrl ? 'direct' : 'youtube',
       creator: req.user.id,
       creatorName,
-      category
+      category,
+      promptDate
     });
     await video.save();
     res.json(video);
@@ -97,28 +129,6 @@ router.delete('/:id', auth, async (req, res) => {
     }
     await video.deleteOne();
     res.json({ msg: 'Video deleted' });
-  } catch (err) {
-    res.status(500).json({ msg: 'Server error' });
-  }
-});
-
-// GET trending videos - smart algorithm
-router.get("/trending", async (req, res) => {
-  try {
-    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const videos = await Video.find({ createdAt: { $gte: oneWeekAgo } });
-    
-    // Score = likes*3 + views*1 + recency bonus
-    const scored = videos.map(v => {
-      const ageHours = (Date.now() - new Date(v.createdAt)) / 3600000;
-      const recencyBonus = ageHours < 24 ? 50 : ageHours < 48 ? 20 : 0;
-      const score = (v.likes * 3) + (v.views * 1) + recencyBonus;
-      return { ...v.toObject(), score };
-    });
-
-    scored.sort((a, b) => b.score - a.score);
-    res.json(scored.slice(0, 10));
   } catch (err) {
     res.status(500).json({ msg: 'Server error' });
   }
