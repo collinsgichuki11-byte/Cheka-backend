@@ -130,7 +130,7 @@ router.get('/:id/remixes', async (req, res) => {
 // POST submit video
 router.post('/', auth, async (req, res) => {
   try {
-    const { title, youtubeUrl, creatorName, videoUrl, category, monetized, caption, durationSec, remixOf } = req.body;
+    const { title, youtubeUrl, videoUrl, category, monetized, caption, durationSec, remixOf } = req.body || {};
     if (!title || !title.trim()) return res.status(400).json({ msg: 'Title is required' });
     const youtubeId = getYoutubeId(youtubeUrl);
     if (!youtubeId && !videoUrl) return res.status(400).json({ msg: 'Please provide a YouTube URL or upload a video' });
@@ -142,6 +142,12 @@ router.post('/', auth, async (req, res) => {
       remixOfId = original._id;
     }
 
+    // Derive creatorName from the authenticated user — never trust the client.
+    const creator = await User.findById(req.user.id).select('username displayName');
+    if (!creator) return res.status(401).json({ msg: 'User not found' });
+    const ALLOWED_CATEGORIES = new Set(['General','Comedy','Skits','Memes','Roasts','Standup']);
+    const safeCategory = ALLOWED_CATEGORIES.has(category) ? category : 'General';
+
     const video = new Video({
       title: title.trim().slice(0, 120),
       caption: (caption || '').toString().trim().slice(0, 300),
@@ -151,8 +157,8 @@ router.post('/', auth, async (req, res) => {
       videoType: videoUrl ? 'direct' : 'youtube',
       durationSec: Math.max(0, Math.min(600, Number(durationSec) || 0)),
       creator: req.user.id,
-      creatorName,
-      category,
+      creatorName: creator.displayName || creator.username,
+      category: safeCategory,
       monetized: monetized !== false,
       remixOf: remixOfId
     });

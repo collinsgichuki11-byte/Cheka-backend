@@ -21,9 +21,10 @@ const adminAuth = (req, res, next) => {
   });
 };
 
-// Helper: today's date in Africa/Nairobi (YYYY-MM-DD)
+// Helper: today's date in UTC (YYYY-MM-DD). Uniform globally so the daily prompt
+// resets at the same moment for every user.
 function nairobiToday() {
-  return new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Nairobi' });
+  return new Date().toISOString().slice(0, 10);
 }
 
 // GET today's prompt + countdown info
@@ -31,16 +32,10 @@ router.get('/today', async (req, res) => {
   try {
     const date = nairobiToday();
     const prompt = await Prompt.findOne({ date });
-    // Compute next 6PM Nairobi cutoff (when today's battle ends / tomorrow's drops)
-    const now = new Date();
-    const nairobiNowStr = now.toLocaleString('en-US', { timeZone: 'Africa/Nairobi', hour12: false });
-    const [datePart, timePart] = nairobiNowStr.split(', ');
-    const [h] = timePart.split(':').map(Number);
-    // Next 6PM EAT in UTC ms
-    const tomorrow6pmEAT = new Date(`${date}T18:00:00+03:00`);
-    let nextDrop = tomorrow6pmEAT.getTime();
-    if (Date.now() > nextDrop) nextDrop = nextDrop + 24 * 3600 * 1000;
-    res.json({ date, prompt, nextDropAt: new Date(nextDrop).toISOString() });
+    // Next drop at the next 00:00 UTC.
+    const nextMidnight = new Date();
+    nextMidnight.setUTCHours(24, 0, 0, 0);
+    res.json({ date, prompt, nextDropAt: nextMidnight.toISOString() });
   } catch (err) {
     res.status(500).json({ msg: 'Server error' });
   }

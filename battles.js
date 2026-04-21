@@ -5,7 +5,7 @@ const Video = require('./Video');
 const promptsModule = require('./prompts');
 
 function nairobiToday() {
-  return new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Nairobi' });
+  return new Date().toISOString().slice(0, 10);
 }
 
 function scoreVideo(v) {

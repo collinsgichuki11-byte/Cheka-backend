@@ -4,7 +4,7 @@ const jwt = require('jsonwebtoken');
 const User = require('./User');
 const Video = require('./Video');
 const Follow = require('./Follow');
-const Settings = require('./Settings');
+const PlatformSettings = require('./PlatformSettings');
 
 const auth = (req, res, next) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
@@ -16,7 +16,7 @@ const auth = (req, res, next) => {
 // Meta-inspired eligibility rules adapted for Cheka.
 // Mirrors Facebook In-Stream Ads / Reels Play criteria.
 const RULES = {
-  minFollowers: 1000,           // Meta requires 5,000 page followers; we use a Kenya-friendly 1,000
+  minFollowers: 1000,           // Meta requires 5,000 page followers; we start at 1,000 to encourage early creators
   minPublishedVideos: 5,        // Meta requires 5 active videos
   minTotalViews: 10000,         // proxy for Meta's 60,000 watch-time minutes
   minAccountAgeDays: 30,        // Meta requires steady activity history
@@ -32,7 +32,7 @@ async function computeEligibility(userId) {
   const [followerCount, videos, settings] = await Promise.all([
     Follow.countDocuments({ following: userId }),
     Video.find({ creator: userId }),
-    Settings.findOne({ key: 'platform' })
+    PlatformSettings.findOne({ key: 'main' })
   ]);
 
   const recentVideos = videos.filter(v => new Date(v.createdAt) >= sixtyDaysAgo);
