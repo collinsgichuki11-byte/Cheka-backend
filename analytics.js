@@ -143,4 +143,122 @@ router.get('/summary', requireAuth, adminOnly, async (req, res) => {
   }
 });
 
+// GET creator dashboard — 28-day timeseries + best posting hour heatmap + top hashtags + summary
+router.get('/creator/me', requireAuth, async (req, res) => {
+  try {
+    const Video = require('./Video');
+    const me = req.user.id;
+    const since = new Date(Date.now() - 28 * 24 * 60 * 60 * 1000);
+
+    const videos = await Video.find({ creator: me }).select('_id title views likes loops saves shares reposts remixCount estimatedEarnings tipsReceived hashtags createdAt durationSec').lean();
+
+    // Per-day totals from analytics events for this creator's videos
+    const videoIds = videos.map(v => String(v._id));
+    const events = await Analytics.find({
+      type: { $in: ['video_view','video_like','video_loop','video_share'] },
+      video: { $in: videoIds },
+      createdAt: { $gte: since }
+    }).select('type video createdAt').lean();
+
+    // Day buckets (YYYY-MM-DD)
+    const dayBuckets = {};
+    for (let i = 0; i < 28; i++) {
+      const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
+      const key = d.toISOString().slice(0, 10);
+      dayBuckets[key] = { date: key, views: 0, likes: 0, loops: 0, shares: 0 };
+    }
+    for (const ev of events) {
+      const k = new Date(ev.createdAt).toISOString().slice(0, 10);
+      if (!dayBuckets[k]) continue;
+      if (ev.type === 'video_view') dayBuckets[k].views++;
+      else if (ev.type === 'video_like') dayBuckets[k].likes++;
+      else if (ev.type === 'video_loop') dayBuckets[k].loops++;
+      else if (ev.type === 'video_share') dayBuckets[k].shares++;
+    }
+    const timeseries = Object.values(dayBuckets).sort((a, b) => a.date.localeCompare(b.date));
+
+    // Best posting hour: count of cumulative views grouped by upload hour
+    const hourBuckets = Array.from({ length: 24 }, (_, h) => ({ hour: h, count: 0, views: 0 }));
+    for (const v of videos) {
+      const h = new Date(v.createdAt).getHours();
+      hourBuckets[h].count++;
+      hourBuckets[h].views += v.views || 0;
+    }
+
+    // Top hashtags
+    const tagMap = {};
+    for (const v of videos) {
+      for (const t of v.hashtags || []) {
+        tagMap[t] = (tagMap[t] || 0) + (v.views || 0) + (v.likes || 0) * 3;
+      }
+    }
+    const topHashtags = Object.entries(tagMap).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([tag, score]) => ({ tag, score }));
+
+    // Top videos by engagement
+    const topVideos = [...videos].map(v => ({
+      ...v,
+      engagement: (v.views || 0) + (v.likes || 0) * 5 + (v.loops || 0) * 0.5 + (v.saves || 0) * 4
+    })).sort((a, b) => b.engagement - a.engagement).slice(0, 10);
+
+    // Totals
+    const totals = videos.reduce((acc, v) => {
+      acc.videos++;
+      acc.views += v.views || 0;
+      acc.likes += v.likes || 0;
+      acc.loops += v.loops || 0;
+      acc.saves += v.saves || 0;
+      acc.shares += v.shares || 0;
+      acc.reposts += v.reposts || 0;
+      acc.remixes += v.remixCount || 0;
+      acc.earnings += v.estimatedEarnings || 0;
+      acc.tips += v.tipsReceived || 0;
+      return acc;
+    }, { videos: 0, views: 0, likes: 0, loops: 0, saves: 0, shares: 0, reposts: 0, remixes: 0, earnings: 0, tips: 0 });
+    totals.earnings = Number(totals.earnings.toFixed(4));
+
+    res.json({ totals, timeseries, hourBuckets, topHashtags, topVideos });
+  } catch (err) {
+    console.error('creator analytics', err.message);
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET per-video analytics (must be the owner)
+router.get('/video/:id', requireAuth, async (req, res) => {
+  try {
+    const Video = require('./Video');
+    const v = await Video.findById(req.params.id).lean();
+    if (!v) return res.status(404).json({ msg: 'Not found' });
+    if (String(v.creator) !== req.user.id) return res.status(403).json({ msg: 'Not your video' });
+
+    const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+    const events = await Analytics.find({
+      video: String(v._id),
+      type: { $in: ['video_view','video_like','video_loop','video_share'] },
+      createdAt: { $gte: since }
+    }).select('type createdAt').lean();
+
+    const buckets = {};
+    for (let i = 0; i < 14; i++) {
+      const k = new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+      buckets[k] = { date: k, views: 0, likes: 0, loops: 0, shares: 0 };
+    }
+    for (const ev of events) {
+      const k = new Date(ev.createdAt).toISOString().slice(0, 10);
+      if (!buckets[k]) continue;
+      if (ev.type === 'video_view') buckets[k].views++;
+      else if (ev.type === 'video_like') buckets[k].likes++;
+      else if (ev.type === 'video_loop') buckets[k].loops++;
+      else if (ev.type === 'video_share') buckets[k].shares++;
+    }
+    res.json({
+      video: { _id: v._id, title: v.title, views: v.views, likes: v.likes, loops: v.loops, saves: v.saves, shares: v.shares, reposts: v.reposts, remixCount: v.remixCount, estimatedEarnings: v.estimatedEarnings, tipsReceived: v.tipsReceived, durationSec: v.durationSec },
+      timeseries: Object.values(buckets).sort((a, b) => a.date.localeCompare(b.date))
+    });
+  } catch (err) {
+    console.error('video analytics', err.message);
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
 module.exports = router;

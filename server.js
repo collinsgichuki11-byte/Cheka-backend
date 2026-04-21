@@ -27,6 +27,10 @@ const monetizationRoutes = require('./monetization');
 const battleRoutes = require('./battles');
 const promptRoutes = require('./prompts');
 const reportRoutes = require('./reports');
+const pushRoutes = require('./push');
+const verificationRoutes = require('./verifications');
+const referralRoutes = require('./referrals');
+const Video = require('./Video');
 
 connectDB();
 
@@ -54,6 +58,25 @@ app.use('/api/monetization', monetizationRoutes);
 app.use('/api/battles', battleRoutes);
 app.use('/api/prompts', promptRoutes);
 app.use('/api/reports', reportRoutes);
+app.use('/api/push', pushRoutes);
+app.use('/api/verifications', verificationRoutes);
+app.use('/api/referrals', referralRoutes);
+
+// Background job: every 60s, auto-publish any scheduled posts whose time has come.
+setInterval(async () => {
+  try {
+    const now = new Date();
+    const due = await Video.find({ publishAt: { $lte: now, $ne: null }, isDraft: { $ne: true } }).select('_id');
+    if (!due.length) return;
+    await Video.updateMany(
+      { _id: { $in: due.map(d => d._id) } },
+      { $set: { publishAt: null, createdAt: now } }
+    );
+    console.log(`[scheduler] published ${due.length} scheduled video(s)`);
+  } catch (e) {
+    console.error('[scheduler] failed:', e.message);
+  }
+}, 60_000).unref?.();
 
 // Catch-all 404 for unknown API routes
 app.use('/api', (req, res) => res.status(404).json({ msg: 'Not found' }));
