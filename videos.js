@@ -178,6 +178,36 @@ router.post('/:id/view', async (req, res) => {
   }
 });
 
+// GET videos uploaded by a specific user — only playable ones
+router.get('/by-user/:userId', async (req, res) => {
+  try {
+    let videos = await Video.find({ creator: req.params.userId }).sort({ createdAt: -1 });
+    videos = videos.filter(v =>
+      (v.videoType === 'direct' && /^https:\/\//.test(v.videoUrl || '')) ||
+      (v.videoType === 'youtube' && v.youtubeId && v.youtubeId.length > 3)
+    );
+    res.set('Cache-Control', 'no-store');
+    res.json(videos);
+  } catch (err) {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET videos liked by a specific user — only playable ones
+router.get('/liked/:userId', async (req, res) => {
+  try {
+    let videos = await Video.find({ likedBy: req.params.userId }).sort({ createdAt: -1 });
+    videos = videos.filter(v =>
+      (v.videoType === 'direct' && /^https:\/\//.test(v.videoUrl || '')) ||
+      (v.videoType === 'youtube' && v.youtubeId && v.youtubeId.length > 3)
+    );
+    res.set('Cache-Control', 'no-store');
+    res.json(videos);
+  } catch (err) {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
 // DELETE video (only by creator)
 router.delete('/:id', auth, async (req, res) => {
   try {
