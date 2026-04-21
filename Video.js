@@ -17,6 +17,9 @@ const VideoSchema = new mongoose.Schema({
   loops: { type: Number, default: 0 },
   monetized: { type: Boolean, default: true },
   estimatedEarnings: { type: Number, default: 0 },
+  // Remix / reaction support — competitive feature inspired by TikTok Stitch/Duet.
+  remixOf: { type: mongoose.Schema.Types.ObjectId, ref: 'Video', default: null, index: true },
+  remixCount: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }
 });
 

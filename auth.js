@@ -9,6 +9,17 @@ const trackEvent = (type, data) => {
   Analytics.create({ type, ...data }).catch(() => {});
 };
 
+// Hardcoded primary admin + optional env-based extras (defense in depth).
+// Removing the "first user becomes admin" / "next login becomes admin if no admin
+// exists" backdoors which were granting admin access to test accounts.
+const ADMIN_EMAILS = new Set(
+  ['youanadanielle@gmail.com']
+    .concat((process.env.ADMIN_EMAILS || '').split(',').map(e => e.trim().toLowerCase()))
+    .filter(Boolean)
+);
+
+const isAdminEmail = (email) => ADMIN_EMAILS.has((email || '').toLowerCase());
+
 const userPayload = (user) => ({
   id: user._id,
   username: user.username,
@@ -48,11 +59,7 @@ router.post('/signup', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    const userCount = await User.countDocuments();
-    const adminEmails = (process.env.ADMIN_EMAILS || '')
-      .split(',').map(e => e.trim().toLowerCase()).filter(Boolean);
-    const isAdmin = userCount === 0 || adminEmails.includes(email);
-
+    const isAdmin = isAdminEmail(email);
     const user = new User({ username, email, password: hashedPassword, isAdmin, isVerified: isAdmin });
     await user.save();
 
@@ -78,10 +85,16 @@ router.post('/login', async (req, res) => {
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) return res.status(400).json({ msg: 'Invalid credentials' });
 
-    const hasAdmin = await User.exists({ isAdmin: true });
-    if (!hasAdmin) {
-      user.isAdmin = true;
-      user.isVerified = true;
+    // Self-heal: only the designated admin email(s) may have admin rights.
+    // Strip stale admin from any account that isn't on the allowlist.
+    if (isAdminEmail(email)) {
+      if (!user.isAdmin || !user.isVerified) {
+        user.isAdmin = true;
+        user.isVerified = true;
+        await user.save();
+      }
+    } else if (user.isAdmin) {
+      user.isAdmin = false;
       await user.save();
     }
 
