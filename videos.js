@@ -16,16 +16,19 @@ const auth = (req, res, next) => {
 };
 
 const getYoutubeId = (url) => {
-  const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/)([^&\n?#]+)/);
+  if (!url) return null;
+  const match = url.match(/(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/)([^&\n?#]+)/);
   return match ? match[1] : null;
 };
+
+const isHttpsUrl = (s) => typeof s === 'string' && /^https:\/\/[^\s]+$/.test(s.trim());
 
 function nairobiToday() {
   return new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Nairobi' });
 }
 
-// GET trending videos - smart algorithm (must come before / GET to avoid conflicts? Express handles fine)
-router.get("/trending", async (req, res) => {
+// GET trending videos
+router.get('/trending', async (req, res) => {
   try {
     const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
     const videos = await Video.find({ createdAt: { $gte: oneWeekAgo } });
@@ -42,11 +45,17 @@ router.get("/trending", async (req, res) => {
   }
 });
 
-// GET all videos with optional category filter
+// GET all videos with optional category filter — only playable ones
 router.get('/', async (req, res) => {
   try {
     const filter = req.query.category ? { category: req.query.category } : {};
-    const videos = await Video.find(filter).sort({ createdAt: -1 });
+    let videos = await Video.find(filter).sort({ createdAt: -1 });
+    // Skip broken records — direct must have a real videoUrl, youtube must have an id
+    videos = videos.filter(v =>
+      (v.videoType === 'direct' && /^https:\/\//.test(v.videoUrl || '')) ||
+      (v.videoType === 'youtube' && v.youtubeId && v.youtubeId.length > 3)
+    );
+    res.set('Cache-Control', 'no-store');
     res.json(videos);
   } catch (err) {
     res.status(500).json({ msg: 'Server error' });
@@ -57,8 +66,29 @@ router.get('/', async (req, res) => {
 router.post('/', auth, async (req, res) => {
   try {
     const { title, youtubeUrl, creatorName, videoUrl, category, enterBattle } = req.body;
-    const youtubeId = getYoutubeId(youtubeUrl || '');
-    if (!youtubeId && !videoUrl) return res.status(400).json({ msg: 'Please provide a YouTube URL or upload a video' });
+
+    if (!title || !title.trim()) return res.status(400).json({ msg: 'Title is required' });
+    if (!creatorName || !creatorName.trim()) return res.status(400).json({ msg: 'Creator name missing — please log in again' });
+
+    const trimmedVideoUrl = (videoUrl || '').trim();
+    const trimmedYoutubeUrl = (youtubeUrl || '').trim();
+    const youtubeId = getYoutubeId(trimmedYoutubeUrl);
+
+    let videoType, finalVideoUrl = '', finalYoutubeId = '', finalYoutubeUrl = '';
+
+    if (trimmedVideoUrl) {
+      if (!isHttpsUrl(trimmedVideoUrl)) {
+        return res.status(400).json({ msg: 'Video URL is invalid. Please re-upload your video.' });
+      }
+      videoType = 'direct';
+      finalVideoUrl = trimmedVideoUrl;
+    } else if (youtubeId) {
+      videoType = 'youtube';
+      finalYoutubeId = youtubeId;
+      finalYoutubeUrl = trimmedYoutubeUrl;
+    } else {
+      return res.status(400).json({ msg: 'Please upload a video file or paste a valid YouTube URL.' });
+    }
 
     let promptDate = '';
     if (enterBattle) {
@@ -68,20 +98,21 @@ router.post('/', auth, async (req, res) => {
     }
 
     const video = new Video({
-      title,
-      youtubeUrl: youtubeUrl || '',
-      youtubeId: youtubeId || '',
-      videoUrl: videoUrl || '',
-      videoType: videoUrl ? 'direct' : 'youtube',
+      title: title.trim(),
+      youtubeUrl: finalYoutubeUrl,
+      youtubeId: finalYoutubeId,
+      videoUrl: finalVideoUrl,
+      videoType,
       creator: req.user.id,
-      creatorName,
-      category,
+      creatorName: creatorName.trim(),
+      category: category || 'General',
       promptDate
     });
     await video.save();
     res.json(video);
   } catch (err) {
-    res.status(500).json({ msg: 'Server error' });
+    console.error('Video upload error:', err);
+    res.status(500).json({ msg: 'Server error: ' + (err.message || 'unknown') });
   }
 });
 
@@ -90,6 +121,7 @@ router.post('/:id/like', async (req, res) => {
   try {
     const { userId } = req.body;
     const video = await Video.findById(req.params.id);
+    if (!video) return res.status(404).json({ msg: 'Video not found' });
     const alreadyLiked = video.likedBy.includes(userId);
     if (alreadyLiked) {
       video.likes = Math.max(0, video.likes - 1);
@@ -113,7 +145,7 @@ router.post('/:id/view', async (req, res) => {
       { $inc: { views: 1 } },
       { new: true }
     );
-    res.json({ views: video.views });
+    res.json({ views: video?.views || 0 });
   } catch (err) {
     res.status(500).json({ msg: 'Server error' });
   }
