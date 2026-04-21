@@ -12,6 +12,7 @@ const VideoSchema = new mongoose.Schema({
   likedBy: [{ type: String }],
   category: { type: String, default: "General", enum: ["General","Comedy","Skits","Memes","Roasts","Standup"] },
   views: { type: Number, default: 0 },
+  promptDate: { type: String, default: '', index: true }, // YYYY-MM-DD if entered into a battle
   createdAt: { type: Date, default: Date.now }
 });
 
