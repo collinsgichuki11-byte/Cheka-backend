@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
 const Notification = require('./Notification');
+const User = require('./User');
 
 const auth = (req, res, next) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
@@ -10,29 +11,34 @@ const auth = (req, res, next) => {
   catch { res.status(401).json({ msg: 'Invalid token' }); }
 };
 
-// GET my notifications
+// GET my notifications (sender enriched with username)
 router.get('/', auth, async (req, res) => {
   try {
     const notifs = await Notification.find({ recipient: req.user.id })
-      .sort({ createdAt: -1 }).limit(50);
-    res.json(notifs);
+      .sort({ createdAt: -1 }).limit(50).lean();
+    const senderIds = [...new Set(notifs.map(n => n.sender).filter(Boolean))];
+    const senders = await User.find({ _id: { $in: senderIds } }).select('_id username displayName');
+    const map = new Map(senders.map(u => [String(u._id), { _id: u._id, username: u.username, displayName: u.displayName }]));
+    res.json(notifs.map(n => ({ ...n, sender: map.get(String(n.sender)) || { username: 'someone' } })));
   } catch { res.status(500).json({ msg: 'Server error' }); }
 });
 
 // POST create notification — sender forced to authed user
 router.post('/', auth, async (req, res) => {
   try {
-    const { recipient, type, videoTitle, videoId } = req.body;
-    if (!recipient || !type || !videoTitle || !videoId) {
-      return res.status(400).json({ msg: 'Missing fields' });
+    const { recipient, type, videoTitle, videoId, snippet } = req.body;
+    const ALLOWED = ['like','comment','follow','remix','repost','save','mention','reply'];
+    if (!recipient || !ALLOWED.includes(type)) {
+      return res.status(400).json({ msg: 'Missing or invalid fields' });
     }
     if (recipient === req.user.id) return res.json({ msg: 'No self notify' });
     const notif = new Notification({
       recipient,
       sender: req.user.id,
       type,
-      videoTitle: String(videoTitle).slice(0, 200),
-      videoId: String(videoId)
+      videoTitle: String(videoTitle || '').slice(0, 200),
+      videoId: String(videoId || ''),
+      snippet: String(snippet || '').slice(0, 200)
     });
     await notif.save();
     res.json(notif);

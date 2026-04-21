@@ -3,6 +3,8 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const Video = require('./Video');
 const User = require('./User');
+const Follow = require('./Follow');
+const Notification = require('./Notification');
 const PlatformSettings = require('./PlatformSettings');
 const Analytics = require('./Analytics');
 
@@ -35,13 +37,15 @@ const trackEvent = (type, data) => {
   Analytics.create({ type, ...data }).catch(() => {});
 };
 
-// Force Cloudinary to deliver an h.264 mp4 so it plays on every browser
-// (Safari/iOS especially refuses HEVC and WebM). Idempotent.
+const notify = (data) => {
+  Notification.create(data).catch(() => {});
+};
+
 const normalizeCloudinaryUrl = (url) => {
   if (!url || typeof url !== 'string') return url;
   if (!url.includes('res.cloudinary.com')) return url;
   if (!url.includes('/upload/')) return url;
-  if (/\/upload\/[^/]*f_mp4/.test(url)) return url; // already normalized
+  if (/\/upload\/[^/]*f_mp4/.test(url)) return url;
   return url.replace('/upload/', '/upload/f_mp4,vc_h264,q_auto/');
 };
 
@@ -52,12 +56,36 @@ const decorateVideo = (v) => {
   return obj;
 };
 
-const POPULATE_CREATOR = 'username displayName isVerified monetizationEnabled monetizationStatus';
+// Pull #hashtags out of title + caption. Lowercased, deduped, max 10.
+const extractHashtags = (...sources) => {
+  const out = new Set();
+  for (const s of sources) {
+    if (!s) continue;
+    const matches = String(s).match(/#([a-zA-Z0-9_]{1,30})/g);
+    if (!matches) continue;
+    for (const m of matches) {
+      const tag = m.slice(1).toLowerCase();
+      if (tag) out.add(tag);
+      if (out.size >= 10) break;
+    }
+  }
+  return [...out];
+};
 
-// GET all videos with optional category filter
-router.get('/', async (req, res) => {
+const POPULATE_CREATOR = 'username displayName isVerified monetizationEnabled monetizationStatus isPrivate';
+
+// Hide private videos from anonymous viewers and from users who are not the owner.
+const visibilityFilter = (req) => {
+  const me = req.user?.id;
+  if (!me) return { isPrivate: { $ne: true } };
+  return { $or: [{ isPrivate: { $ne: true } }, { creator: me }] };
+};
+
+// GET all videos (For You feed) with optional category filter
+router.get('/', optionalAuth, async (req, res) => {
   try {
-    const filter = req.query.category ? { category: req.query.category } : {};
+    const filter = { ...visibilityFilter(req) };
+    if (req.query.category) filter.category = req.query.category;
     const videos = await Video.find(filter).sort({ createdAt: -1 }).populate('creator', POPULATE_CREATOR);
     res.json(videos.map(decorateVideo));
   } catch {
@@ -65,60 +93,149 @@ router.get('/', async (req, res) => {
   }
 });
 
-// GET trending videos - smart algorithm
-router.get('/trending', async (req, res) => {
+// GET trending — smart score
+router.get('/trending', optionalAuth, async (req, res) => {
   try {
     const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-    const videos = await Video.find({ createdAt: { $gte: oneWeekAgo } }).populate('creator', POPULATE_CREATOR);
+    const filter = { ...visibilityFilter(req), createdAt: { $gte: oneWeekAgo } };
+    const videos = await Video.find(filter).populate('creator', POPULATE_CREATOR);
     const scored = videos.map(v => {
       const ageHours = (Date.now() - new Date(v.createdAt)) / 3600000;
       const recencyBonus = ageHours < 24 ? 50 : ageHours < 48 ? 20 : 0;
       const remixBoost = (v.remixCount || 0) * 5;
-      const score = (v.likes * 3) + (v.views * 1) + (v.loops * 0.5) + remixBoost + recencyBonus;
+      const repostBoost = (v.reposts || 0) * 4;
+      const saveBoost = (v.saves || 0) * 2;
+      const score = (v.likes * 3) + (v.views * 1) + (v.loops * 0.5) + remixBoost + repostBoost + saveBoost + recencyBonus;
       return { ...decorateVideo(v), score };
     });
     scored.sort((a, b) => b.score - a.score);
-    res.json(scored.slice(0, 10));
+    res.json(scored.slice(0, 20));
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET following feed — videos from users the auth user follows
+router.get('/following-feed', auth, async (req, res) => {
+  try {
+    const follows = await Follow.find({ follower: req.user.id }).select('following');
+    const ids = follows.map(f => f.following);
+    if (!ids.length) return res.json([]);
+    const videos = await Video.find({ creator: { $in: ids }, isPrivate: { $ne: true } })
+      .sort({ createdAt: -1 }).limit(60).populate('creator', POPULATE_CREATOR);
+    res.json(videos.map(decorateVideo));
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET videos by hashtag
+router.get('/by-hashtag/:tag', optionalAuth, async (req, res) => {
+  try {
+    const tag = String(req.params.tag || '').toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 30);
+    if (!tag) return res.json([]);
+    const filter = { ...visibilityFilter(req), hashtags: tag };
+    const videos = await Video.find(filter).sort({ likes: -1, createdAt: -1 }).limit(60).populate('creator', POPULATE_CREATOR);
+    res.json(videos.map(decorateVideo));
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET trending hashtags (top 20)
+router.get('/hashtags/trending', async (req, res) => {
+  try {
+    const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const agg = await Video.aggregate([
+      { $match: { createdAt: { $gte: oneWeekAgo }, isPrivate: { $ne: true }, hashtags: { $exists: true, $ne: [] } } },
+      { $unwind: '$hashtags' },
+      { $group: { _id: '$hashtags', count: { $sum: 1 }, likes: { $sum: '$likes' }, views: { $sum: '$views' } } },
+      { $project: { _id: 0, tag: '$_id', count: 1, likes: 1, views: 1, score: { $add: ['$count', { $divide: ['$likes', 5] }, { $divide: ['$views', 50] }] } } },
+      { $sort: { score: -1 } },
+      { $limit: 20 }
+    ]);
+    res.json(agg);
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET videos saved by current user
+router.get('/saved/me', auth, async (req, res) => {
+  try {
+    const videos = await Video.find({ savedBy: req.user.id, isPrivate: { $ne: true } })
+      .sort({ createdAt: -1 }).populate('creator', POPULATE_CREATOR);
+    res.json(videos.map(decorateVideo));
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET videos by username (handle)
+router.get('/by-username/:username', optionalAuth, async (req, res) => {
+  try {
+    const u = await User.findOne({ username: req.params.username }).select('_id isPrivate');
+    if (!u) return res.status(404).json({ msg: 'User not found' });
+    const isOwner = req.user?.id === String(u._id);
+    if (u.isPrivate && !isOwner) return res.json([]);
+    const videos = await Video.find({ creator: u._id, isPrivate: isOwner ? undefined : { $ne: true } })
+      .sort({ isPinned: -1, createdAt: -1 }).populate('creator', POPULATE_CREATOR);
+    res.json(videos.map(decorateVideo));
   } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
 
 // GET single video
-router.get('/:id', async (req, res) => {
+router.get('/:id', optionalAuth, async (req, res) => {
   try {
     const video = await Video.findById(req.params.id).populate('creator', POPULATE_CREATOR);
     if (!video) return res.status(404).json({ msg: 'Video not found' });
+    if (video.isPrivate && String(video.creator?._id || video.creator) !== req.user?.id) {
+      return res.status(403).json({ msg: 'This video is private' });
+    }
     res.json(decorateVideo(video));
   } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
 
-// GET videos by a specific creator (by userId)
-router.get('/by-user/:userId', async (req, res) => {
+// GET videos by user ID — sorted with pinned first
+// ?reposts=1 returns videos this user has reposted (not authored)
+router.get('/by-user/:userId', optionalAuth, async (req, res) => {
   try {
-    const videos = await Video.find({ creator: req.params.userId }).sort({ createdAt: -1 }).populate('creator', POPULATE_CREATOR);
+    const isOwner = req.user?.id === req.params.userId;
+    let filter;
+    if (req.query.reposts === '1') {
+      filter = { repostedBy: req.params.userId, isPrivate: { $ne: true } };
+    } else {
+      filter = { creator: req.params.userId };
+      if (!isOwner) filter.isPrivate = { $ne: true };
+    }
+    const videos = await Video.find(filter)
+      .sort({ isPinned: -1, createdAt: -1 })
+      .populate('creator', POPULATE_CREATOR);
     res.json(videos.map(decorateVideo));
   } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
 
-// GET videos liked by a specific user
+// GET videos liked by a user
 router.get('/liked/:userId', async (req, res) => {
   try {
-    const videos = await Video.find({ likedBy: req.params.userId }).sort({ createdAt: -1 }).populate('creator', POPULATE_CREATOR);
+    const videos = await Video.find({ likedBy: req.params.userId, isPrivate: { $ne: true } })
+      .sort({ createdAt: -1 }).populate('creator', POPULATE_CREATOR);
     res.json(videos.map(decorateVideo));
   } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
 
-// GET remixes of a video — community reaction stream
+// GET remixes of a video
 router.get('/:id/remixes', async (req, res) => {
   try {
-    const remixes = await Video.find({ remixOf: req.params.id })
+    const remixes = await Video.find({ remixOf: req.params.id, isPrivate: { $ne: true } })
       .sort({ likes: -1, createdAt: -1 })
       .populate('creator', POPULATE_CREATOR);
     res.json(remixes.map(decorateVideo));
@@ -130,27 +247,29 @@ router.get('/:id/remixes', async (req, res) => {
 // POST submit video
 router.post('/', auth, async (req, res) => {
   try {
-    const { title, youtubeUrl, videoUrl, category, monetized, caption, durationSec, remixOf } = req.body || {};
+    const { title, youtubeUrl, videoUrl, category, monetized, caption, durationSec, remixOf, isPrivate } = req.body || {};
     if (!title || !title.trim()) return res.status(400).json({ msg: 'Title is required' });
     const youtubeId = getYoutubeId(youtubeUrl);
     if (!youtubeId && !videoUrl) return res.status(400).json({ msg: 'Please provide a YouTube URL or upload a video' });
 
     let remixOfId = null;
     if (remixOf) {
-      const original = await Video.findById(remixOf).select('_id');
+      const original = await Video.findById(remixOf).select('_id creator title');
       if (!original) return res.status(400).json({ msg: 'Original video for remix not found' });
       remixOfId = original._id;
     }
 
-    // Derive creatorName from the authenticated user — never trust the client.
-    const creator = await User.findById(req.user.id).select('username displayName');
+    const creator = await User.findById(req.user.id).select('username displayName notifyOnRemix');
     if (!creator) return res.status(401).json({ msg: 'User not found' });
     const ALLOWED_CATEGORIES = new Set(['General','Comedy','Skits','Memes','Roasts','Standup']);
     const safeCategory = ALLOWED_CATEGORIES.has(category) ? category : 'General';
 
+    const cleanTitle = title.trim().slice(0, 120);
+    const cleanCaption = (caption || '').toString().trim().slice(0, 300);
+
     const video = new Video({
-      title: title.trim().slice(0, 120),
-      caption: (caption || '').toString().trim().slice(0, 300),
+      title: cleanTitle,
+      caption: cleanCaption,
       youtubeUrl: youtubeUrl || '',
       youtubeId: youtubeId || '',
       videoUrl: normalizeCloudinaryUrl(videoUrl || ''),
@@ -160,12 +279,21 @@ router.post('/', auth, async (req, res) => {
       creatorName: creator.displayName || creator.username,
       category: safeCategory,
       monetized: monetized !== false,
+      isPrivate: !!isPrivate,
+      hashtags: extractHashtags(cleanTitle, cleanCaption),
       remixOf: remixOfId
     });
     await video.save();
 
     if (remixOfId) {
-      await Video.findByIdAndUpdate(remixOfId, { $inc: { remixCount: 1 } });
+      const original = await Video.findByIdAndUpdate(remixOfId, { $inc: { remixCount: 1 } }, { new: true }).select('creator title');
+      // Notify the original creator (if not self)
+      if (original && String(original.creator) !== req.user.id) {
+        const owner = await User.findById(original.creator).select('notifyOnRemix');
+        if (owner?.notifyOnRemix !== false) {
+          notify({ recipient: String(original.creator), sender: req.user.id, type: 'remix', videoTitle: original.title, videoId: String(original._id), snippet: cleanTitle });
+        }
+      }
     }
 
     trackEvent('video_upload', { user: req.user.id, video: video._id, meta: { videoType: video.videoType, durationSec: video.durationSec, remix: !!remixOfId } });
@@ -175,7 +303,7 @@ router.post('/', auth, async (req, res) => {
   }
 });
 
-// POST like/unlike — auth required, uses token user
+// POST like / unlike
 router.post('/:id/like', auth, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -190,6 +318,12 @@ router.post('/:id/like', auth, async (req, res) => {
       video.likedBy.push(userId);
     }
     await video.save();
+    if (!alreadyLiked && String(video.creator) !== userId) {
+      const owner = await User.findById(video.creator).select('notifyOnLike');
+      if (owner?.notifyOnLike !== false) {
+        notify({ recipient: String(video.creator), sender: userId, type: 'like', videoTitle: video.title, videoId: String(video._id) });
+      }
+    }
     trackEvent(alreadyLiked ? 'video_unlike' : 'video_like', { user: userId, video: video._id });
     res.json({ likes: video.likes, liked: !alreadyLiked });
   } catch {
@@ -197,16 +331,114 @@ router.post('/:id/like', auth, async (req, res) => {
   }
 });
 
-// POST increment view count + monetization accrual
+// POST save / unsave (bookmark)
+router.post('/:id/save', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const video = await Video.findById(req.params.id);
+    if (!video) return res.status(404).json({ msg: 'Video not found' });
+    const already = video.savedBy.includes(userId);
+    if (already) {
+      video.savedBy = video.savedBy.filter(id => id !== userId);
+      video.saves = Math.max(0, video.saves - 1);
+    } else {
+      video.savedBy.push(userId);
+      video.saves += 1;
+    }
+    await video.save();
+    res.json({ saved: !already, saves: video.saves });
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// POST share — increments share counter
+router.post('/:id/share', optionalAuth, async (req, res) => {
+  try {
+    const video = await Video.findByIdAndUpdate(req.params.id, { $inc: { shares: 1 } }, { new: true, projection: { shares: 1 } });
+    if (!video) return res.status(404).json({ msg: 'Video not found' });
+    trackEvent('video_share', { user: req.user?.id || null, video: req.params.id });
+    res.json({ shares: video.shares });
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// POST repost / un-repost — adds video to your followers' feed signal
+router.post('/:id/repost', auth, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const video = await Video.findById(req.params.id);
+    if (!video) return res.status(404).json({ msg: 'Video not found' });
+    const already = video.repostedBy.includes(userId);
+    if (already) {
+      video.repostedBy = video.repostedBy.filter(id => id !== userId);
+      video.reposts = Math.max(0, video.reposts - 1);
+    } else {
+      video.repostedBy.push(userId);
+      video.reposts += 1;
+      if (String(video.creator) !== userId) {
+        notify({ recipient: String(video.creator), sender: userId, type: 'repost', videoTitle: video.title, videoId: String(video._id) });
+      }
+    }
+    await video.save();
+    res.json({ reposted: !already, reposts: video.reposts });
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// POST pin / unpin own video on profile (max 3 pinned)
+router.post('/:id/pin', auth, async (req, res) => {
+  try {
+    const video = await Video.findById(req.params.id);
+    if (!video) return res.status(404).json({ msg: 'Video not found' });
+    if (String(video.creator) !== req.user.id) return res.status(403).json({ msg: 'Not your video' });
+    if (!video.isPinned) {
+      const pinnedCount = await Video.countDocuments({ creator: req.user.id, isPinned: true });
+      if (pinnedCount >= 3) return res.status(400).json({ msg: 'You can pin at most 3 videos' });
+    }
+    video.isPinned = !video.isPinned;
+    await video.save();
+    res.json({ isPinned: video.isPinned });
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// POST toggle privacy on own video
+router.post('/:id/privacy', auth, async (req, res) => {
+  try {
+    const video = await Video.findById(req.params.id);
+    if (!video) return res.status(404).json({ msg: 'Video not found' });
+    if (String(video.creator) !== req.user.id) return res.status(403).json({ msg: 'Not your video' });
+    video.isPrivate = !video.isPrivate;
+    await video.save();
+    res.json({ isPrivate: video.isPrivate });
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// POST toggle comments lock on own video
+router.post('/:id/comments-lock', auth, async (req, res) => {
+  try {
+    const video = await Video.findById(req.params.id);
+    if (!video) return res.status(404).json({ msg: 'Video not found' });
+    if (String(video.creator) !== req.user.id) return res.status(403).json({ msg: 'Not your video' });
+    video.commentsDisabled = !video.commentsDisabled;
+    await video.save();
+    res.json({ commentsDisabled: video.commentsDisabled });
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// POST view (with monetization)
 router.post('/:id/view', optionalAuth, async (req, res) => {
   try {
-    const video = await Video.findByIdAndUpdate(
-      req.params.id,
-      { $inc: { views: 1 } },
-      { new: true }
-    );
+    const video = await Video.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } }, { new: true });
     if (!video) return res.status(404).json({ msg: 'Video not found' });
-
     const [creator, settings] = await Promise.all([
       User.findById(video.creator),
       PlatformSettings.findOne({ key: 'main' })
@@ -217,9 +449,7 @@ router.post('/:id/view', optionalAuth, async (req, res) => {
       video.estimatedEarnings = Number(((video.estimatedEarnings || 0) + perView).toFixed(4));
       await Promise.all([
         video.save(),
-        User.findByIdAndUpdate(video.creator, {
-          $inc: { earningsBalance: perView, totalEarnings: perView }
-        })
+        User.findByIdAndUpdate(video.creator, { $inc: { earningsBalance: perView, totalEarnings: perView } })
       ]);
     }
     trackEvent('video_view', { user: req.user?.id || null, video: video._id });
@@ -229,14 +459,10 @@ router.post('/:id/view', optionalAuth, async (req, res) => {
   }
 });
 
-// POST loop — Vine-style replay counter
+// POST loop counter
 router.post('/:id/loop', optionalAuth, async (req, res) => {
   try {
-    const video = await Video.findByIdAndUpdate(
-      req.params.id,
-      { $inc: { loops: 1 } },
-      { new: true, projection: { loops: 1 } }
-    );
+    const video = await Video.findByIdAndUpdate(req.params.id, { $inc: { loops: 1 } }, { new: true, projection: { loops: 1 } });
     if (!video) return res.status(404).json({ msg: 'Video not found' });
     trackEvent('video_loop', { user: req.user?.id || null, video: req.params.id });
     res.json({ loops: video.loops });
@@ -245,7 +471,7 @@ router.post('/:id/loop', optionalAuth, async (req, res) => {
   }
 });
 
-// DELETE video (only by creator or admin) — also orphans remixes and decrements parent.
+// DELETE video — creator or admin. Also orphans remixes and decrements parent count.
 router.delete('/:id', auth, async (req, res) => {
   try {
     const video = await Video.findById(req.params.id);
@@ -257,9 +483,7 @@ router.delete('/:id', auth, async (req, res) => {
     const parentId = video.remixOf;
     await video.deleteOne();
     await Promise.all([
-      // Orphan remixes that pointed at the deleted video
       Video.updateMany({ remixOf: req.params.id }, { $set: { remixOf: null } }),
-      // Decrement remix counter on the parent if this was a remix
       parentId ? Video.findByIdAndUpdate(parentId, { $inc: { remixCount: -1 } }) : Promise.resolve()
     ]);
     res.json({ msg: 'Video deleted' });

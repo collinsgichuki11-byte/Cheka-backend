@@ -3,6 +3,7 @@ const router = express.Router();
 const jwt = require('jsonwebtoken');
 const Follow = require('./Follow');
 const User = require('./User');
+const Notification = require('./Notification');
 
 const auth = (req, res, next) => {
   const token = req.header('Authorization')?.replace('Bearer ', '');
@@ -26,6 +27,16 @@ router.post('/:creatorId', auth, async (req, res) => {
       res.json({ following: false });
     } else {
       await Follow.create({ follower: req.user.id, following: req.params.creatorId });
+      const target = await User.findById(req.params.creatorId).select('notifyOnFollow');
+      if (target?.notifyOnFollow !== false) {
+        Notification.create({
+          recipient: req.params.creatorId,
+          sender: req.user.id,
+          type: 'follow',
+          videoTitle: '',
+          videoId: ''
+        }).catch(() => {});
+      }
       res.json({ following: true });
     }
   } catch (err) {

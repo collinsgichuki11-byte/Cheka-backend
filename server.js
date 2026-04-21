@@ -26,6 +26,7 @@ const analyticsRoutes = require('./analytics');
 const monetizationRoutes = require('./monetization');
 const battleRoutes = require('./battles');
 const promptRoutes = require('./prompts');
+const reportRoutes = require('./reports');
 
 connectDB();
 
@@ -52,6 +53,7 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/monetization', monetizationRoutes);
 app.use('/api/battles', battleRoutes);
 app.use('/api/prompts', promptRoutes);
+app.use('/api/reports', reportRoutes);
 
 // Catch-all 404 for unknown API routes
 app.use('/api', (req, res) => res.status(404).json({ msg: 'Not found' }));
