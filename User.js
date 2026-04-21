@@ -8,8 +8,9 @@ const UserSchema = new mongoose.Schema({
   isAdmin: { type: Boolean, default: false },
   isVerified: { type: Boolean, default: false },
   monetizationEnabled: { type: Boolean, default: false },
-  monetizationStatus: { type: String, default: 'inactive' },
+  monetizationStatus: { type: String, default: 'inactive' }, // inactive | pending | active | suspended
   totalEarnings: { type: Number, default: 0 },
+  strikes: { type: Number, default: 0 },
   bio: { type: String, default: '' },
   avatar: { type: String, default: '' },
   createdAt: { type: Date, default: Date.now }
