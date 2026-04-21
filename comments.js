@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const Comment = require('./Comment');
 const User = require('./User');
 const Video = require('./Video');
@@ -13,23 +14,29 @@ const auth = (req, res, next) => {
   catch { res.status(401).json({ msg: 'Invalid token' }); }
 };
 
-const notify = (data) => { Notification.create(data).catch(() => {}); };
+const notify = (data) => { Notification.create(data).catch(err => console.error('notify failed:', err.message)); };
+
+const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
 
 // GET top-level comments for a video (with reply counts) — sorted: pinned first, then newest
 router.get('/:videoId', async (req, res) => {
   try {
+    if (!isValidId(req.params.videoId)) return res.status(400).json({ msg: 'Invalid video id' });
     const top = await Comment.find({ video: req.params.videoId, parentComment: null })
       .sort({ isPinned: -1, createdAt: -1 })
       .limit(200)
       .lean();
     const ids = top.map(c => c._id);
-    const replyCounts = await Comment.aggregate([
-      { $match: { parentComment: { $in: ids } } },
-      { $group: { _id: '$parentComment', count: { $sum: 1 } } }
-    ]);
+    const replyCounts = ids.length
+      ? await Comment.aggregate([
+          { $match: { parentComment: { $in: ids } } },
+          { $group: { _id: '$parentComment', count: { $sum: 1 } } }
+        ])
+      : [];
     const countMap = new Map(replyCounts.map(r => [String(r._id), r.count]));
     res.json(top.map(c => ({ ...c, replyCount: countMap.get(String(c._id)) || 0 })));
-  } catch {
+  } catch (err) {
+    console.error('GET /comments/:videoId failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -37,10 +44,12 @@ router.get('/:videoId', async (req, res) => {
 // GET replies for a comment thread
 router.get('/replies/:commentId', async (req, res) => {
   try {
+    if (!isValidId(req.params.commentId)) return res.status(400).json({ msg: 'Invalid comment id' });
     const replies = await Comment.find({ parentComment: req.params.commentId })
       .sort({ createdAt: 1 }).limit(200).lean();
     res.json(replies);
-  } catch {
+  } catch (err) {
+    console.error('GET /comments/replies/:commentId failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -48,8 +57,16 @@ router.get('/replies/:commentId', async (req, res) => {
 // POST a comment (top-level or reply via parentComment)
 router.post('/:videoId', auth, async (req, res) => {
   try {
+    if (!isValidId(req.params.videoId)) return res.status(400).json({ msg: 'Invalid video id' });
+
     const text = (req.body?.text || '').toString().trim();
-    const parentComment = req.body?.parentComment || null;
+    const rawParent = req.body?.parentComment;
+    let parentComment = null;
+    if (rawParent && rawParent !== 'null' && rawParent !== 'undefined') {
+      if (!isValidId(rawParent)) return res.status(400).json({ msg: 'Invalid parent comment id' });
+      parentComment = rawParent;
+    }
+
     if (!text) return res.status(400).json({ msg: 'Comment cannot be empty' });
     if (text.length > 500) return res.status(400).json({ msg: 'Comment too long (500 max)' });
 
@@ -60,29 +77,55 @@ router.post('/:videoId', auth, async (req, res) => {
     if (!video) return res.status(404).json({ msg: 'Video not found' });
     if (video.commentsDisabled) return res.status(403).json({ msg: 'Comments disabled' });
 
+    // Honor the video creator's whoCanComment privacy setting.
+    const creator = await User.findById(video.creator).select('whoCanComment notifyOnComment blocked');
+    if (creator) {
+      if ((creator.blocked || []).map(String).includes(String(req.user.id))) {
+        return res.status(403).json({ msg: 'You cannot comment on this video' });
+      }
+      if (creator.whoCanComment === 'noone' && String(video.creator) !== req.user.id) {
+        return res.status(403).json({ msg: 'Comments are restricted' });
+      }
+      // 'followers' enforcement is intentionally not blocking here yet — needs a Follow lookup.
+    }
+
     const comment = new Comment({
       video: req.params.videoId,
       user: req.user.id,
       username: me.username,
       text,
-      parentComment: parentComment || null
+      parentComment
     });
     await comment.save();
 
     if (parentComment) {
       const parent = await Comment.findById(parentComment).select('user video');
       if (parent && String(parent.user) !== req.user.id) {
-        notify({ recipient: String(parent.user), sender: req.user.id, type: 'reply', videoTitle: video.title, videoId: String(video._id), snippet: text.slice(0, 140) });
+        notify({
+          recipient: String(parent.user),
+          sender: req.user.id,
+          type: 'reply',
+          videoTitle: video.title,
+          videoId: String(video._id),
+          snippet: text.slice(0, 140)
+        });
       }
     } else if (String(video.creator) !== req.user.id) {
-      const owner = await User.findById(video.creator).select('notifyOnComment');
-      if (owner?.notifyOnComment !== false) {
-        notify({ recipient: String(video.creator), sender: req.user.id, type: 'comment', videoTitle: video.title, videoId: String(video._id), snippet: text.slice(0, 140) });
+      if (creator?.notifyOnComment !== false) {
+        notify({
+          recipient: String(video.creator),
+          sender: req.user.id,
+          type: 'comment',
+          videoTitle: video.title,
+          videoId: String(video._id),
+          snippet: text.slice(0, 140)
+        });
       }
     }
 
     res.json(comment);
-  } catch {
+  } catch (err) {
+    console.error('POST /comments/:videoId failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -90,20 +133,23 @@ router.post('/:videoId', auth, async (req, res) => {
 // POST like / unlike a comment
 router.post('/:id/like', auth, async (req, res) => {
   try {
+    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid comment id' });
     const c = await Comment.findById(req.params.id);
     if (!c) return res.status(404).json({ msg: 'Not found' });
-    const uid = req.user.id;
-    const liked = c.likedBy.includes(uid);
+    const uid = String(req.user.id);
+    const likedByStrings = (c.likedBy || []).map(String);
+    const liked = likedByStrings.includes(uid);
     if (liked) {
-      c.likedBy = c.likedBy.filter(id => id !== uid);
-      c.likes = Math.max(0, c.likes - 1);
+      c.likedBy = likedByStrings.filter(id => id !== uid);
+      c.likes = Math.max(0, (c.likes || 0) - 1);
     } else {
-      c.likedBy.push(uid);
-      c.likes += 1;
+      c.likedBy = [...likedByStrings, uid];
+      c.likes = (c.likes || 0) + 1;
     }
     await c.save();
     res.json({ liked: !liked, likes: c.likes });
-  } catch {
+  } catch (err) {
+    console.error('POST /comments/:id/like failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -111,6 +157,7 @@ router.post('/:id/like', auth, async (req, res) => {
 // POST pin / unpin comment — only by the video's creator
 router.post('/:id/pin', auth, async (req, res) => {
   try {
+    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid comment id' });
     const c = await Comment.findById(req.params.id);
     if (!c) return res.status(404).json({ msg: 'Not found' });
     const v = await Video.findById(c.video).select('creator');
@@ -123,7 +170,8 @@ router.post('/:id/pin', auth, async (req, res) => {
     c.isPinned = !c.isPinned;
     await c.save();
     res.json({ isPinned: c.isPinned });
-  } catch {
+  } catch (err) {
+    console.error('POST /comments/:id/pin failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -131,6 +179,7 @@ router.post('/:id/pin', auth, async (req, res) => {
 // DELETE — author, video creator, or admin
 router.delete('/:id', auth, async (req, res) => {
   try {
+    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid comment id' });
     const comment = await Comment.findById(req.params.id);
     if (!comment) return res.status(404).json({ msg: 'Not found' });
     const me = await User.findById(req.user.id).select('isAdmin');
@@ -144,7 +193,8 @@ router.delete('/:id', auth, async (req, res) => {
     // Also delete replies
     await Comment.deleteMany({ parentComment: req.params.id });
     res.json({ msg: 'Deleted' });
-  } catch {
+  } catch (err) {
+    console.error('DELETE /comments/:id failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
