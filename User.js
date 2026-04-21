@@ -9,6 +9,7 @@ const UserSchema = new mongoose.Schema({
   isVerified: { type: Boolean, default: false },
   monetizationEnabled: { type: Boolean, default: false },
   monetizationStatus: { type: String, default: 'inactive' },
+  totalEarnings: { type: Number, default: 0 },
   bio: { type: String, default: '' },
   avatar: { type: String, default: '' },
   createdAt: { type: Date, default: Date.now }
