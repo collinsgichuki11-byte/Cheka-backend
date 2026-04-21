@@ -13,6 +13,7 @@ const adminRoutes = require('./admin');
 const messageRoutes = require('./messages');
 const promptRoutes = require('./prompts');
 const battleRoutes = require('./battles');
+const monetizationRoutes = require('./monetization');
 
 dotenv.config();
 connectDB();
@@ -37,6 +38,7 @@ app.use('/api/admin', adminRoutes);
 app.use('/api/messages', messageRoutes);
 app.use('/api/prompts', promptRoutes);
 app.use('/api/battles', battleRoutes);
+app.use('/api/monetization', monetizationRoutes);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Cheka server running on port ${PORT}`));
