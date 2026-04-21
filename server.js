@@ -11,6 +11,8 @@ const followRoutes = require('./follows');
 const userRoutes = require('./users');
 const adminRoutes = require('./admin');
 const messageRoutes = require('./messages');
+const promptRoutes = require('./prompts');
+const battleRoutes = require('./battles');
 
 dotenv.config();
 connectDB();
@@ -33,6 +35,8 @@ app.use('/api/follows', followRoutes);
 app.use('/api/users', userRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/messages', messageRoutes);
+app.use('/api/prompts', promptRoutes);
+app.use('/api/battles', battleRoutes);
 
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => console.log(`Cheka server running on port ${PORT}`));
