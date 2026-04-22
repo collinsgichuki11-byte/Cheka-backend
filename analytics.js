@@ -258,6 +258,10 @@ router.get('/creator/heatmap/me', auth, async (req, res) => {
     const Video = require('./Video');
     const mongoose = require('mongoose');
     const meObjectId = new mongoose.Types.ObjectId(req.user.id);
+    // For each (dayOfWeek, hourOfDay) slot the user posted in, compute the
+    // average engagement-per-video. Engagement = views+likes+comments+
+    // shares+saves. This answers "when do my posts perform best?" rather
+    // than "when have I posted most often".
     const rows = await Video.aggregate([
       { $match: { creator: meObjectId } },
       { $group: {
@@ -267,20 +271,35 @@ router.get('/creator/heatmap/me', auth, async (req, res) => {
           },
           views: { $sum: '$views' },
           likes: { $sum: '$likes' },
+          comments: { $sum: { $ifNull: ['$commentCount', 0] } },
+          shares: { $sum: '$shares' },
+          saves: { $sum: '$saves' },
           count: { $sum: 1 }
       } },
-      { $project: { _id: 0, dow: '$_id.dow', hour: '$_id.hour', views: 1, likes: 1, count: 1 } }
+      { $project: {
+          _id: 0, dow: '$_id.dow', hour: '$_id.hour',
+          views: 1, likes: 1, comments: 1, shares: 1, saves: 1, count: 1,
+          avgEngagement: {
+            $divide: [
+              { $add: ['$views', '$likes', '$comments', '$shares', '$saves'] },
+              { $max: ['$count', 1] }
+            ]
+          }
+      } }
     ]);
-    // Build a 7x24 grid filled with zeros so the UI doesn't have to.
+    // Grid stores avg engagement per slot.
     const grid = Array.from({ length: 7 }, () => Array(24).fill(0));
-    let bestViews = -1; let best = null;
+    let bestVal = -1; let best = null;
     for (const r of rows) {
-      // Mongo $dayOfWeek: 1=Sun..7=Sat. Convert to 0..6 with 0=Sun for grid.
+      // Mongo $dayOfWeek: 1=Sun..7=Sat → 0..6 with 0=Sun for grid.
       const d = (r.dow - 1) % 7;
-      grid[d][r.hour] = r.views;
-      if (r.views > bestViews) { bestViews = r.views; best = { day: d, hour: r.hour, views: r.views }; }
+      grid[d][r.hour] = r.avgEngagement;
+      if (r.avgEngagement > bestVal) {
+        bestVal = r.avgEngagement;
+        best = { day: d, hour: r.hour, avgEngagement: r.avgEngagement, posts: r.count };
+      }
     }
-    res.json({ grid, best, rows });
+    res.json({ grid, best, rows, metric: 'avgEngagement' });
   } catch (err) {
     console.error('GET /analytics/creator/heatmap/me failed:', err);
     res.status(500).json({ msg: 'Server error' });

@@ -90,13 +90,17 @@ router.get('/', optionalAuth, async (req, res) => {
       .populate('creator', POPULATE_CREATOR);
     if (!pool.length) return res.json([]);
 
-    // Build the "interacted creators" set from follows + recent likes/comments.
+    // Build TWO distinct sets so the ranker can apply different bonuses:
+    //   followedCreators   — creators the viewer follows (1.2x)
+    //   interactedCreators — creators the viewer has actually liked or
+    //                        commented on (1.5x; takes precedence)
     const [follows, recentLikes, recentComments] = await Promise.all([
       Follow.find({ follower: req.user.id }).select('following').lean(),
       Video.find({ likedBy: req.user.id }).select('creator').limit(200).lean(),
       Comment.find({ user: req.user.id }).select('video').limit(200).lean()
     ]);
-    const interactedCreators = new Set(follows.map(f => String(f.following)));
+    const followedCreators = new Set(follows.map(f => String(f.following)));
+    const interactedCreators = new Set();
     for (const v of recentLikes) interactedCreators.add(String(v.creator));
     if (recentComments.length) {
       const vids = await Video.find({ _id: { $in: recentComments.map(c => c.video) } })
@@ -113,7 +117,7 @@ router.get('/', optionalAuth, async (req, res) => {
     const cmap = new Map(counts.map(c => [String(c._id), c.n]));
     for (const v of pool) v.commentCount = cmap.get(String(v._id)) || 0;
 
-    const ranked = rankVideos(pool, { interactedCreators });
+    const ranked = rankVideos(pool, { followedCreators, interactedCreators });
     res.json(ranked.slice(0, limit).map(decorateVideo));
   } catch (err) {
     console.error('GET /videos failed:', err);
