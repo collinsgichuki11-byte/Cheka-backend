@@ -1,8 +1,9 @@
 const mongoose = require('mongoose');
+
 const NotificationSchema = new mongoose.Schema({
   recipient: { type: String, required: true, index: true },
   sender: { type: String, required: true },
-  type: { type: String, enum: ['like','comment','follow','remix','repost','save','mention','reply'], required: true },
+  type: { type: String, enum: ['like','comment','follow','remix','repost','save','mention','reply','live','tip','message'], required: true },
   videoTitle: { type: String, default: '' },
   videoId: { type: String, default: '' },
   // Optional snippet (e.g. comment text, reply text)
@@ -10,41 +11,57 @@ const NotificationSchema = new mongoose.Schema({
   read: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now }
 });
-// After a notification is created, fan it out as a web push to the recipient.
-// Failures are swallowed — the in-app notification is the source of truth.
-NotificationSchema.post('save', function (doc) {
+
+const VERBS = {
+  like: 'liked your video',
+  comment: 'commented on your video',
+  reply: 'replied to your comment',
+  follow: 'started following you',
+  remix: 'remixed your video',
+  repost: 'reposted your video',
+  save: 'saved your video',
+  mention: 'mentioned you',
+  live: 'is live now',
+  tip: 'sent you a tip',
+  message: 'sent you a message'
+};
+
+// Track newness across the save() lifecycle so post('save') only fires for inserts.
+NotificationSchema.pre('save', function (next) {
+  this.$locals.wasNew = this.isNew;
+  next();
+});
+
+// Post-save hook: fire web push to the recipient on every new notification.
+NotificationSchema.post('save', async function (doc) {
+  if (!doc.$locals?.wasNew) return; // skip updates (e.g. mark-as-read)
   try {
-    const { sendToUser } = require('./lib/pushSender');
-    const titleMap = {
-      like: 'Someone liked your video',
-      comment: 'New comment on your video',
-      reply: 'Someone replied to your comment',
-      follow: 'You have a new follower',
-      remix: 'Someone remixed your video',
-      repost: 'Your video was reposted',
-      save: 'Someone saved your video',
-      mention: 'You were mentioned'
-    };
-    const title = titleMap[doc.type] || 'Cheka';
+    const User = require('./User');
+    const { sendPushTo } = require('./webpush');
+    const sender = await User.findById(doc.sender).select('username displayName').lean().catch(() => null);
+    const senderName = sender?.displayName || sender?.username || 'Someone';
+    const verb = VERBS[doc.type] || 'sent you an update';
     const body = doc.snippet
-      ? doc.snippet.slice(0, 100)
-      : (doc.videoTitle ? doc.videoTitle.slice(0, 100) : 'Open Cheka to see more');
-    // Route to the most relevant screen for each notification type:
-    //   - follow → the new follower's profile
-    //   - everything else with a videoId → the specific video in the feed
-    //   - fallback → the notifications screen
-    let url;
-    if (doc.type === 'follow' && doc.sender) {
-      url = `/profile.html?u=${encodeURIComponent(doc.sender)}`;
-    } else if (doc.videoId) {
-      url = `/feed.html?v=${doc.videoId}`;
-    } else {
-      url = '/notifications.html';
-    }
-    sendToUser(doc.recipient, { title, body, url, type: doc.type, tag: 'cheka-' + doc.type })
-      .catch(err => console.error('push fanout failed:', err.message));
-  } catch (err) {
-    console.error('Notification post-save push hook failed:', err.message);
+      ? `${senderName} ${verb}: "${doc.snippet}"`
+      : doc.videoTitle
+        ? `${senderName} ${verb} "${doc.videoTitle}"`
+        : `${senderName} ${verb}`;
+    const url = doc.videoId
+      ? `/watch.html?id=${doc.videoId}`
+      : doc.type === 'follow'
+        ? `/user-profile.html?id=${doc.sender}`
+        : doc.type === 'message'
+          ? `/chat.html?user=${doc.sender}&name=${encodeURIComponent(senderName.replace(/^@/, ''))}`
+          : '/notifications.html';
+    sendPushTo(doc.recipient, {
+      type: doc.type,
+      title: 'Cheka',
+      body,
+      url,
+      tag: `cheka-${doc.type}-${doc._id}`
+    }).catch(() => {});
+  } catch (e) {
+    // Never let push failure block notification creation
   }
 });
 

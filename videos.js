@@ -1,15 +1,31 @@
 const express = require('express');
 const router = express.Router();
+const jwt = require('jsonwebtoken');
 const Video = require('./Video');
 const User = require('./User');
 const Follow = require('./Follow');
 const Notification = require('./Notification');
 const PlatformSettings = require('./PlatformSettings');
 const Analytics = require('./Analytics');
-const Prompt = require('./Prompt');
-const Comment = require('./Comment');
-const { auth, optionalAuth, isValidId } = require('./lib/auth');
-const { rankVideos } = require('./lib/rank');
+
+const auth = (req, res, next) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ msg: 'No token' });
+  try {
+    req.user = jwt.verify(token, process.env.JWT_SECRET);
+    next();
+  } catch {
+    res.status(401).json({ msg: 'Invalid token' });
+  }
+};
+
+const optionalAuth = (req, res, next) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (!token) { req.user = null; return next(); }
+  try { req.user = jwt.verify(token, process.env.JWT_SECRET); }
+  catch { req.user = null; }
+  next();
+};
 
 const getYoutubeId = (url) => {
   if (!url) return null;
@@ -18,11 +34,11 @@ const getYoutubeId = (url) => {
 };
 
 const trackEvent = (type, data) => {
-  Analytics.create({ type, ...data }).catch(err => console.error('analytics failed:', err.message));
+  Analytics.create({ type, ...data }).catch(() => {});
 };
 
 const notify = (data) => {
-  Notification.create(data).catch(err => console.error('notify failed:', err.message));
+  Notification.create(data).catch(() => {});
 };
 
 const normalizeCloudinaryUrl = (url) => {
@@ -31,18 +47,6 @@ const normalizeCloudinaryUrl = (url) => {
   if (!url.includes('/upload/')) return url;
   if (/\/upload\/[^/]*f_mp4/.test(url)) return url;
   return url.replace('/upload/', '/upload/f_mp4,vc_h264,q_auto/');
-};
-
-// Cloudinary auto-derives an .mp3 sibling for any uploaded video — just
-// strip the f_mp4 transformation and rename the extension. Returns '' if
-// the URL isn't a Cloudinary upload (e.g. YouTube videos have no audio asset).
-const deriveCloudinaryAudioUrl = (videoUrl) => {
-  if (!videoUrl || typeof videoUrl !== 'string') return '';
-  if (!videoUrl.includes('res.cloudinary.com') || !videoUrl.includes('/upload/')) return '';
-  // Drop any /upload/<transforms>/ block so we get the raw asset, then
-  // change the file extension to .mp3.
-  let stripped = videoUrl.replace(/\/upload\/[^/]+\//, '/upload/');
-  return stripped.replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.mp3$2');
 };
 
 const decorateVideo = (v) => {
@@ -73,66 +77,90 @@ const POPULATE_CREATOR = 'username displayName isVerified monetizationEnabled mo
 // Hide private videos from anonymous viewers and from users who are not the owner.
 const visibilityFilter = (req) => {
   const me = req.user?.id;
-  if (!me) return { isPrivate: { $ne: true } };
-  return { $or: [{ isPrivate: { $ne: true } }, { creator: me }] };
+  // Combine published + privacy clauses with $and so neither $or wipes the other.
+  const publishedOr = [
+    { publishAt: null },
+    { publishAt: { $exists: false } },
+    { publishAt: { $lte: new Date() } }
+  ];
+  if (!me) {
+    return { isDraft: { $ne: true }, isPrivate: { $ne: true }, $or: publishedOr };
+  }
+  // Owner can see their own private posts in mixed feeds; drafts/scheduled stay
+  // hidden from feeds and only surface through /drafts/me and /scheduled/me.
+  return {
+    isDraft: { $ne: true },
+    $and: [
+      { $or: publishedOr },
+      { $or: [{ isPrivate: { $ne: true } }, { creator: me }] }
+    ]
+  };
 };
 
-// GET all videos (For You feed) with optional category filter.
-// - Anonymous viewers ALWAYS get raw reverse-chronological so the feed is
-//   stable for first-time visitors and search engines.
-// - Authenticated viewers get the smart ranker, which mixes engagement,
-//   recency decay, and a personal "interacted with creator before" bonus,
-//   then enforces no-same-creator-in-a-row diversity.
-// - ?sort=new forces recency for any caller (used by the Watch tab toggle).
+// GET all videos — smart "For You" feed
+// Sort modes: ?sort=foryou (default) | latest | category
 router.get('/', optionalAuth, async (req, res) => {
   try {
     const filter = { ...visibilityFilter(req) };
     if (req.query.category) filter.category = req.query.category;
-    const limit = Math.min(120, Math.max(20, Number(req.query.limit) || 60));
-    const wantsNew = req.query.sort === 'new';
+    const sort = String(req.query.sort || 'foryou').toLowerCase();
 
-    if (!req.user?.id || wantsNew) {
-      const videos = await Video.find(filter).sort({ createdAt: -1 }).limit(limit)
-        .populate('creator', POPULATE_CREATOR);
+    if (sort === 'latest') {
+      const videos = await Video.find(filter).sort({ createdAt: -1 }).limit(120).populate('creator', POPULATE_CREATOR);
       return res.json(videos.map(decorateVideo));
     }
 
-    // Authed: pull a recent pool then re-rank in memory.
-    const pool = await Video.find(filter).sort({ createdAt: -1 }).limit(400)
+    // Smart feed: pull recent pool, score, then weave with diversity penalty so
+    // a single creator can't dominate the top.
+    const pool = await Video.find(filter)
+      .sort({ createdAt: -1 })
+      .limit(400)
       .populate('creator', POPULATE_CREATOR);
-    if (!pool.length) return res.json([]);
 
-    // Build TWO distinct sets so the ranker can apply different bonuses:
-    //   followedCreators   — creators the viewer follows (1.2x)
-    //   interactedCreators — creators the viewer has actually liked or
-    //                        commented on (1.5x; takes precedence)
-    const [follows, recentLikes, recentComments] = await Promise.all([
-      Follow.find({ follower: req.user.id }).select('following').lean(),
-      Video.find({ likedBy: req.user.id }).select('creator').limit(200).lean(),
-      Comment.find({ user: req.user.id }).select('video').limit(200).lean()
-    ]);
-    const followedCreators = new Set(follows.map(f => String(f.following)));
-    const interactedCreators = new Set();
-    for (const v of recentLikes) interactedCreators.add(String(v.creator));
-    if (recentComments.length) {
-      const vids = await Video.find({ _id: { $in: recentComments.map(c => c.video) } })
-        .select('creator').lean();
-      for (const v of vids) interactedCreators.add(String(v.creator));
+    // Build user interaction signals (cheap — tiny lists already on the doc)
+    const me = req.user?.id;
+    let likedSet = new Set(), savedSet = new Set(), followingSet = new Set();
+    if (me) {
+      try {
+        const follows = await Follow.find({ follower: me }).select('following').lean();
+        followingSet = new Set(follows.map(f => String(f.following)));
+      } catch (_) {}
     }
 
-    // Attach commentCount per video so the ranker can use it.
-    const ids = pool.map(v => v._id);
-    const counts = await Comment.aggregate([
-      { $match: { video: { $in: ids }, parentComment: null } },
-      { $group: { _id: '$video', n: { $sum: 1 } } }
-    ]);
-    const cmap = new Map(counts.map(c => [String(c._id), c.n]));
-    for (const v of pool) v.commentCount = cmap.get(String(v._id)) || 0;
+    const now = Date.now();
+    const scored = pool.map(v => {
+      const ageHrs = Math.max(1, (now - new Date(v.createdAt)) / 3_600_000);
+      const recency = 100 / Math.pow(ageHrs, 0.55);
+      const engagement = (v.likes || 0) * 3 + (v.views || 0) * 0.5 + (v.loops || 0) * 0.3
+        + (v.saves || 0) * 4 + (v.reposts || 0) * 5 + (v.remixCount || 0) * 6;
+      const creatorId = String(v.creator?._id || v.creator || '');
+      const followingBoost = me && followingSet.has(creatorId) ? 35 : 0;
+      const verifiedBoost = v.creator?.isVerified ? 8 : 0;
+      const tipBoost = (v.tipsReceived || 0) * 1.5;
+      const myLikedPenalty = me && (v.likedBy || []).includes(me) ? -40 : 0; // de-dup what I already liked
+      const score = recency + engagement + followingBoost + verifiedBoost + tipBoost + myLikedPenalty;
+      return { v, score, creatorId };
+    }).sort((a, b) => b.score - a.score);
 
-    const ranked = rankVideos(pool, { followedCreators, interactedCreators });
-    res.json(ranked.slice(0, limit).map(decorateVideo));
+    // Diversity weave: cap any single creator at 2 in the top 30 slots.
+    const out = [];
+    const used = new Map(); // creatorId -> count
+    const overflow = [];
+    for (const item of scored) {
+      const c = used.get(item.creatorId) || 0;
+      if (c < 2) {
+        out.push(item.v);
+        used.set(item.creatorId, c + 1);
+      } else {
+        overflow.push(item.v);
+      }
+      if (out.length >= 60) break;
+    }
+    while (out.length < 60 && overflow.length) out.push(overflow.shift());
+
+    res.json(out.map(decorateVideo));
   } catch (err) {
-    console.error('GET /videos failed:', err);
+    console.error('GET /videos failed:', err.message);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -154,8 +182,7 @@ router.get('/trending', optionalAuth, async (req, res) => {
     });
     scored.sort((a, b) => b.score - a.score);
     res.json(scored.slice(0, 20));
-  } catch (err) {
-    console.error('GET /videos/trending failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -169,8 +196,7 @@ router.get('/following-feed', auth, async (req, res) => {
     const videos = await Video.find({ creator: { $in: ids }, isPrivate: { $ne: true } })
       .sort({ createdAt: -1 }).limit(60).populate('creator', POPULATE_CREATOR);
     res.json(videos.map(decorateVideo));
-  } catch (err) {
-    console.error('GET /videos/following-feed failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -183,8 +209,7 @@ router.get('/by-hashtag/:tag', optionalAuth, async (req, res) => {
     const filter = { ...visibilityFilter(req), hashtags: tag };
     const videos = await Video.find(filter).sort({ likes: -1, createdAt: -1 }).limit(60).populate('creator', POPULATE_CREATOR);
     res.json(videos.map(decorateVideo));
-  } catch (err) {
-    console.error('GET /videos/by-hashtag/:tag failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -202,8 +227,7 @@ router.get('/hashtags/trending', async (req, res) => {
       { $limit: 20 }
     ]);
     res.json(agg);
-  } catch (err) {
-    console.error('GET /videos/hashtags/trending failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -214,8 +238,7 @@ router.get('/saved/me', auth, async (req, res) => {
     const videos = await Video.find({ savedBy: req.user.id, isPrivate: { $ne: true } })
       .sort({ createdAt: -1 }).populate('creator', POPULATE_CREATOR);
     res.json(videos.map(decorateVideo));
-  } catch (err) {
-    console.error('GET /videos/saved/me failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -230,8 +253,7 @@ router.get('/by-username/:username', optionalAuth, async (req, res) => {
     const videos = await Video.find({ creator: u._id, isPrivate: isOwner ? undefined : { $ne: true } })
       .sort({ isPinned: -1, createdAt: -1 }).populate('creator', POPULATE_CREATOR);
     res.json(videos.map(decorateVideo));
-  } catch (err) {
-    console.error('GET /videos/by-username/:username failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -239,15 +261,13 @@ router.get('/by-username/:username', optionalAuth, async (req, res) => {
 // GET single video
 router.get('/:id', optionalAuth, async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
     const video = await Video.findById(req.params.id).populate('creator', POPULATE_CREATOR);
     if (!video) return res.status(404).json({ msg: 'Video not found' });
     if (video.isPrivate && String(video.creator?._id || video.creator) !== req.user?.id) {
       return res.status(403).json({ msg: 'This video is private' });
     }
     res.json(decorateVideo(video));
-  } catch (err) {
-    console.error('GET /videos/:id failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -256,7 +276,6 @@ router.get('/:id', optionalAuth, async (req, res) => {
 // ?reposts=1 returns videos this user has reposted (not authored)
 router.get('/by-user/:userId', optionalAuth, async (req, res) => {
   try {
-    if (!isValidId(req.params.userId)) return res.status(400).json({ msg: 'Invalid user id' });
     const isOwner = req.user?.id === req.params.userId;
     let filter;
     if (req.query.reposts === '1') {
@@ -269,8 +288,7 @@ router.get('/by-user/:userId', optionalAuth, async (req, res) => {
       .sort({ isPinned: -1, createdAt: -1 })
       .populate('creator', POPULATE_CREATOR);
     res.json(videos.map(decorateVideo));
-  } catch (err) {
-    console.error('GET /videos/by-user/:userId failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -278,12 +296,10 @@ router.get('/by-user/:userId', optionalAuth, async (req, res) => {
 // GET videos liked by a user
 router.get('/liked/:userId', async (req, res) => {
   try {
-    if (!isValidId(req.params.userId)) return res.status(400).json({ msg: 'Invalid user id' });
     const videos = await Video.find({ likedBy: req.params.userId, isPrivate: { $ne: true } })
       .sort({ createdAt: -1 }).populate('creator', POPULATE_CREATOR);
     res.json(videos.map(decorateVideo));
-  } catch (err) {
-    console.error('GET /videos/liked/:userId failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -291,13 +307,11 @@ router.get('/liked/:userId', async (req, res) => {
 // GET remixes of a video
 router.get('/:id/remixes', async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
     const remixes = await Video.find({ remixOf: req.params.id, isPrivate: { $ne: true } })
       .sort({ likes: -1, createdAt: -1 })
       .populate('creator', POPULATE_CREATOR);
     res.json(remixes.map(decorateVideo));
-  } catch (err) {
-    console.error('GET /videos/:id/remixes failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -305,41 +319,27 @@ router.get('/:id/remixes', async (req, res) => {
 // POST submit video
 router.post('/', auth, async (req, res) => {
   try {
-    const { title, youtubeUrl, videoUrl, category, monetized, caption, durationSec, remixOf, duetOf, originalSoundOf, isPrivate } = req.body || {};
+    const { title, youtubeUrl, videoUrl, category, monetized, caption, durationSec, remixOf, isPrivate, isDraft, publishAt, isDuet, audioOf, chapters } = req.body || {};
     if (!title || !title.trim()) return res.status(400).json({ msg: 'Title is required' });
     const youtubeId = getYoutubeId(youtubeUrl);
     if (!youtubeId && !videoUrl) return res.status(400).json({ msg: 'Please provide a YouTube URL or upload a video' });
 
+    const isObjId = (v) => typeof v === 'string' && /^[a-f\d]{24}$/i.test(v);
+
     let remixOfId = null;
     if (remixOf) {
-      if (!isValidId(remixOf)) return res.status(400).json({ msg: 'Invalid remix source id' });
+      if (!isObjId(remixOf)) return res.status(400).json({ msg: 'Invalid remix reference' });
       const original = await Video.findById(remixOf).select('_id creator title');
       if (!original) return res.status(400).json({ msg: 'Original video for remix not found' });
       remixOfId = original._id;
     }
 
-    let duetOfId = null;
-    if (duetOf) {
-      if (!isValidId(duetOf)) return res.status(400).json({ msg: 'Invalid duet source id' });
-      const original = await Video.findById(duetOf).select('_id creator title audioUrl originalSoundOf');
-      if (!original) return res.status(400).json({ msg: 'Original video for duet not found' });
-      duetOfId = original._id;
-    }
-
-    // Resolve the "sound originator" — the video that owns the audio. For
-    // duets this defaults to the duet source. For "use this sound" uploads
-    // the client can pass originalSoundOf explicitly. We always normalise
-    // to the actual originating video (transitive), so chains of duets all
-    // attribute back to the same source.
-    let soundOriginatorId = null;
-    if (originalSoundOf) {
-      if (!isValidId(originalSoundOf)) return res.status(400).json({ msg: 'Invalid sound source id' });
-      const sound = await Video.findById(originalSoundOf).select('_id originalSoundOf');
-      if (!sound) return res.status(400).json({ msg: 'Original sound not found' });
-      soundOriginatorId = sound.originalSoundOf || sound._id;
-    } else if (duetOfId) {
-      const dsrc = await Video.findById(duetOfId).select('originalSoundOf');
-      soundOriginatorId = (dsrc && dsrc.originalSoundOf) || duetOfId;
+    let audioOfId = null;
+    if (audioOf) {
+      if (!isObjId(audioOf)) return res.status(400).json({ msg: 'Invalid sound reference' });
+      const sound = await Video.findById(audioOf).select('_id');
+      if (!sound) return res.status(400).json({ msg: 'Sound not found' });
+      audioOfId = sound._id;
     }
 
     const creator = await User.findById(req.user.id).select('username displayName notifyOnRemix');
@@ -350,11 +350,21 @@ router.post('/', auth, async (req, res) => {
     const cleanTitle = title.trim().slice(0, 120);
     const cleanCaption = (caption || '').toString().trim().slice(0, 300);
 
-    // Stamp the video with today's prompt date if there is an active prompt for
-    // the day, so /api/battles can group entries without a separate join.
-    const today = new Date().toISOString().slice(0, 10);
-    const todaysPrompt = await Prompt.findOne({ date: today }).select('_id').catch(() => null);
-    const promptDate = todaysPrompt ? today : '';
+    // Schedule: only future ISO strings count; past dates publish immediately.
+    let scheduledAt = null;
+    if (publishAt) {
+      const d = new Date(publishAt);
+      if (!isNaN(d) && d.getTime() > Date.now() + 30_000) scheduledAt = d;
+    }
+
+    // Chapters validation (max 10, sorted by t)
+    const safeChapters = Array.isArray(chapters)
+      ? chapters
+          .filter(c => c && typeof c.t === 'number' && typeof c.label === 'string')
+          .map(c => ({ t: Math.max(0, Math.floor(c.t)), label: String(c.label).slice(0, 60) }))
+          .sort((a, b) => a.t - b.t)
+          .slice(0, 10)
+      : [];
 
     const video = new Video({
       title: cleanTitle,
@@ -369,31 +379,19 @@ router.post('/', auth, async (req, res) => {
       category: safeCategory,
       monetized: monetized !== false,
       isPrivate: !!isPrivate,
+      isDraft: !!isDraft,
+      publishAt: scheduledAt,
+      isDuet: !!isDuet,
+      audioOf: audioOfId,
+      chapters: safeChapters,
       hashtags: extractHashtags(cleanTitle, cleanCaption),
-      remixOf: remixOfId,
-      duetOf: duetOfId,
-      originalSoundOf: soundOriginatorId,
-      // Direct uploads get an mp3 derivative for free from Cloudinary.
-      audioUrl: deriveCloudinaryAudioUrl(videoUrl || ''),
-      promptDate
+      remixOf: remixOfId
     });
     await video.save();
 
-    // Bump duet count + sound use count without blocking the response.
-    if (duetOfId) {
-      Video.updateOne({ _id: duetOfId }, { $inc: { duetCount: 1 } }).catch(err => console.error('duet bump failed:', err.message));
-      Video.findById(duetOfId).select('creator title').then(orig => {
-        if (orig && String(orig.creator) !== req.user.id) {
-          notify({ recipient: String(orig.creator), sender: req.user.id, type: 'duet', videoTitle: orig.title, videoId: String(orig._id), snippet: cleanTitle });
-        }
-      }).catch(() => {});
-    }
-    if (soundOriginatorId) {
-      Video.updateOne({ _id: soundOriginatorId }, { $inc: { soundUseCount: 1 } }).catch(err => console.error('sound bump failed:', err.message));
-    }
-
     if (remixOfId) {
       const original = await Video.findByIdAndUpdate(remixOfId, { $inc: { remixCount: 1 } }, { new: true }).select('creator title');
+      // Notify the original creator (if not self)
       if (original && String(original.creator) !== req.user.id) {
         const owner = await User.findById(original.creator).select('notifyOnRemix');
         if (owner?.notifyOnRemix !== false) {
@@ -404,8 +402,7 @@ router.post('/', auth, async (req, res) => {
 
     trackEvent('video_upload', { user: req.user.id, video: video._id, meta: { videoType: video.videoType, durationSec: video.durationSec, remix: !!remixOfId } });
     res.json(decorateVideo(video));
-  } catch (err) {
-    console.error('POST /videos failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -413,18 +410,16 @@ router.post('/', auth, async (req, res) => {
 // POST like / unlike
 router.post('/:id/like', auth, async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
-    const userId = String(req.user.id);
+    const userId = req.user.id;
     const video = await Video.findById(req.params.id);
     if (!video) return res.status(404).json({ msg: 'Video not found' });
-    const likedByStrings = (video.likedBy || []).map(String);
-    const alreadyLiked = likedByStrings.includes(userId);
+    const alreadyLiked = video.likedBy.includes(userId);
     if (alreadyLiked) {
       video.likes = Math.max(0, video.likes - 1);
-      video.likedBy = likedByStrings.filter(id => id !== userId);
+      video.likedBy = video.likedBy.filter(id => id !== userId);
     } else {
       video.likes += 1;
-      video.likedBy = [...likedByStrings, userId];
+      video.likedBy.push(userId);
     }
     await video.save();
     if (!alreadyLiked && String(video.creator) !== userId) {
@@ -435,8 +430,7 @@ router.post('/:id/like', auth, async (req, res) => {
     }
     trackEvent(alreadyLiked ? 'video_unlike' : 'video_like', { user: userId, video: video._id });
     res.json({ likes: video.likes, liked: !alreadyLiked });
-  } catch (err) {
-    console.error('POST /videos/:id/like failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -444,23 +438,20 @@ router.post('/:id/like', auth, async (req, res) => {
 // POST save / unsave (bookmark)
 router.post('/:id/save', auth, async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
-    const userId = String(req.user.id);
+    const userId = req.user.id;
     const video = await Video.findById(req.params.id);
     if (!video) return res.status(404).json({ msg: 'Video not found' });
-    const savedByStrings = (video.savedBy || []).map(String);
-    const already = savedByStrings.includes(userId);
+    const already = video.savedBy.includes(userId);
     if (already) {
-      video.savedBy = savedByStrings.filter(id => id !== userId);
+      video.savedBy = video.savedBy.filter(id => id !== userId);
       video.saves = Math.max(0, video.saves - 1);
     } else {
-      video.savedBy = [...savedByStrings, userId];
+      video.savedBy.push(userId);
       video.saves += 1;
     }
     await video.save();
     res.json({ saved: !already, saves: video.saves });
-  } catch (err) {
-    console.error('POST /videos/:id/save failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -468,13 +459,11 @@ router.post('/:id/save', auth, async (req, res) => {
 // POST share — increments share counter
 router.post('/:id/share', optionalAuth, async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
     const video = await Video.findByIdAndUpdate(req.params.id, { $inc: { shares: 1 } }, { new: true, projection: { shares: 1 } });
     if (!video) return res.status(404).json({ msg: 'Video not found' });
     trackEvent('video_share', { user: req.user?.id || null, video: req.params.id });
     res.json({ shares: video.shares });
-  } catch (err) {
-    console.error('POST /videos/:id/share failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -482,17 +471,15 @@ router.post('/:id/share', optionalAuth, async (req, res) => {
 // POST repost / un-repost — adds video to your followers' feed signal
 router.post('/:id/repost', auth, async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
-    const userId = String(req.user.id);
+    const userId = req.user.id;
     const video = await Video.findById(req.params.id);
     if (!video) return res.status(404).json({ msg: 'Video not found' });
-    const repostedStrings = (video.repostedBy || []).map(String);
-    const already = repostedStrings.includes(userId);
+    const already = video.repostedBy.includes(userId);
     if (already) {
-      video.repostedBy = repostedStrings.filter(id => id !== userId);
+      video.repostedBy = video.repostedBy.filter(id => id !== userId);
       video.reposts = Math.max(0, video.reposts - 1);
     } else {
-      video.repostedBy = [...repostedStrings, userId];
+      video.repostedBy.push(userId);
       video.reposts += 1;
       if (String(video.creator) !== userId) {
         notify({ recipient: String(video.creator), sender: userId, type: 'repost', videoTitle: video.title, videoId: String(video._id) });
@@ -500,8 +487,7 @@ router.post('/:id/repost', auth, async (req, res) => {
     }
     await video.save();
     res.json({ reposted: !already, reposts: video.reposts });
-  } catch (err) {
-    console.error('POST /videos/:id/repost failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -509,7 +495,6 @@ router.post('/:id/repost', auth, async (req, res) => {
 // POST pin / unpin own video on profile (max 3 pinned)
 router.post('/:id/pin', auth, async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
     const video = await Video.findById(req.params.id);
     if (!video) return res.status(404).json({ msg: 'Video not found' });
     if (String(video.creator) !== req.user.id) return res.status(403).json({ msg: 'Not your video' });
@@ -520,8 +505,7 @@ router.post('/:id/pin', auth, async (req, res) => {
     video.isPinned = !video.isPinned;
     await video.save();
     res.json({ isPinned: video.isPinned });
-  } catch (err) {
-    console.error('POST /videos/:id/pin failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -529,15 +513,13 @@ router.post('/:id/pin', auth, async (req, res) => {
 // POST toggle privacy on own video
 router.post('/:id/privacy', auth, async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
     const video = await Video.findById(req.params.id);
     if (!video) return res.status(404).json({ msg: 'Video not found' });
     if (String(video.creator) !== req.user.id) return res.status(403).json({ msg: 'Not your video' });
     video.isPrivate = !video.isPrivate;
     await video.save();
     res.json({ isPrivate: video.isPrivate });
-  } catch (err) {
-    console.error('POST /videos/:id/privacy failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -545,15 +527,13 @@ router.post('/:id/privacy', auth, async (req, res) => {
 // POST toggle comments lock on own video
 router.post('/:id/comments-lock', auth, async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
     const video = await Video.findById(req.params.id);
     if (!video) return res.status(404).json({ msg: 'Video not found' });
     if (String(video.creator) !== req.user.id) return res.status(403).json({ msg: 'Not your video' });
     video.commentsDisabled = !video.commentsDisabled;
     await video.save();
     res.json({ commentsDisabled: video.commentsDisabled });
-  } catch (err) {
-    console.error('POST /videos/:id/comments-lock failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -561,7 +541,6 @@ router.post('/:id/comments-lock', auth, async (req, res) => {
 // POST view (with monetization)
 router.post('/:id/view', optionalAuth, async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
     const video = await Video.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } }, { new: true });
     if (!video) return res.status(404).json({ msg: 'Video not found' });
     const [creator, settings] = await Promise.all([
@@ -579,8 +558,7 @@ router.post('/:id/view', optionalAuth, async (req, res) => {
     }
     trackEvent('video_view', { user: req.user?.id || null, video: video._id });
     res.json({ views: video.views });
-  } catch (err) {
-    console.error('POST /videos/:id/view failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -588,13 +566,11 @@ router.post('/:id/view', optionalAuth, async (req, res) => {
 // POST loop counter
 router.post('/:id/loop', optionalAuth, async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
     const video = await Video.findByIdAndUpdate(req.params.id, { $inc: { loops: 1 } }, { new: true, projection: { loops: 1 } });
     if (!video) return res.status(404).json({ msg: 'Video not found' });
     trackEvent('video_loop', { user: req.user?.id || null, video: req.params.id });
     res.json({ loops: video.loops });
-  } catch (err) {
-    console.error('POST /videos/:id/loop failed:', err);
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -602,7 +578,6 @@ router.post('/:id/loop', optionalAuth, async (req, res) => {
 // DELETE video — creator or admin. Also orphans remixes and decrements parent count.
 router.delete('/:id', auth, async (req, res) => {
   try {
-    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid video id' });
     const video = await Video.findById(req.params.id);
     if (!video) return res.status(404).json({ msg: 'Video not found' });
     const requester = await User.findById(req.user.id);
@@ -616,8 +591,149 @@ router.delete('/:id', auth, async (req, res) => {
       parentId ? Video.findByIdAndUpdate(parentId, { $inc: { remixCount: -1 } }) : Promise.resolve()
     ]);
     res.json({ msg: 'Video deleted' });
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET drafts for current user
+router.get('/drafts/me', auth, async (req, res) => {
+  try {
+    const drafts = await Video.find({ creator: req.user.id, isDraft: true })
+      .sort({ createdAt: -1 }).populate('creator', POPULATE_CREATOR);
+    res.json(drafts.map(decorateVideo));
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET scheduled posts for current user
+router.get('/scheduled/me', auth, async (req, res) => {
+  try {
+    const sched = await Video.find({ creator: req.user.id, publishAt: { $gt: new Date() }, isDraft: { $ne: true } })
+      .sort({ publishAt: 1 }).populate('creator', POPULATE_CREATOR);
+    res.json(sched.map(decorateVideo));
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// POST publish a draft / scheduled video immediately
+router.post('/:id/publish', auth, async (req, res) => {
+  try {
+    const v = await Video.findById(req.params.id);
+    if (!v) return res.status(404).json({ msg: 'Not found' });
+    if (String(v.creator) !== req.user.id) return res.status(403).json({ msg: 'Not your video' });
+    v.isDraft = false;
+    v.publishAt = null;
+    v.createdAt = new Date(); // surface at top of feed
+    await v.save();
+    res.json(decorateVideo(v));
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// PATCH update schedule on own video
+router.patch('/:id/schedule', auth, async (req, res) => {
+  try {
+    const v = await Video.findById(req.params.id);
+    if (!v) return res.status(404).json({ msg: 'Not found' });
+    if (String(v.creator) !== req.user.id) return res.status(403).json({ msg: 'Not your video' });
+    const { publishAt } = req.body || {};
+    if (!publishAt) {
+      v.publishAt = null;
+    } else {
+      const d = new Date(publishAt);
+      if (isNaN(d) || d.getTime() < Date.now()) return res.status(400).json({ msg: 'Schedule date must be in the future' });
+      v.publishAt = d;
+      v.isDraft = false;
+    }
+    await v.save();
+    res.json({ publishAt: v.publishAt });
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// PATCH chapters on own video
+router.patch('/:id/chapters', auth, async (req, res) => {
+  try {
+    const v = await Video.findById(req.params.id);
+    if (!v) return res.status(404).json({ msg: 'Not found' });
+    if (String(v.creator) !== req.user.id) return res.status(403).json({ msg: 'Not your video' });
+    const list = Array.isArray(req.body?.chapters) ? req.body.chapters : [];
+    v.chapters = list
+      .filter(c => c && typeof c.t === 'number' && typeof c.label === 'string')
+      .map(c => ({ t: Math.max(0, Math.floor(c.t)), label: String(c.label).slice(0, 60) }))
+      .sort((a, b) => a.t - b.t).slice(0, 10);
+    await v.save();
+    res.json({ chapters: v.chapters });
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// POST tip — send coins from current user to a video's creator
+router.post('/:id/tip', auth, async (req, res) => {
+  try {
+    const amount = Math.floor(Number(req.body?.amount) || 0);
+    if (amount <= 0 || amount > 1000) return res.status(400).json({ msg: 'Amount must be 1–1000 coins' });
+    const v = await Video.findById(req.params.id);
+    if (!v) return res.status(404).json({ msg: 'Video not found' });
+    if (String(v.creator) === req.user.id) return res.status(400).json({ msg: 'You cannot tip yourself' });
+    const me = await User.findById(req.user.id);
+    if (!me) return res.status(404).json({ msg: 'User not found' });
+    if ((me.coins || 0) < amount) return res.status(400).json({ msg: 'Not enough coins. Top up first.' });
+
+    me.coins = (me.coins || 0) - amount;
+    await me.save();
+    await Promise.all([
+      User.findByIdAndUpdate(v.creator, { $inc: { coins: amount, totalTipsReceived: amount } }),
+      Video.findByIdAndUpdate(v._id, { $inc: { tipsReceived: amount } })
+    ]);
+    notify({
+      recipient: String(v.creator),
+      sender: req.user.id,
+      type: 'tip',
+      videoTitle: v.title,
+      videoId: String(v._id),
+      snippet: `+${amount} coins`
+    });
+    trackEvent('tip', { user: req.user.id, video: v._id, meta: { amount } });
+    res.json({ ok: true, amount, balance: me.coins });
   } catch (err) {
-    console.error('DELETE /videos/:id failed:', err);
+    console.error('tip error', err.message);
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET videos using a given audio/sound (audioOf reference)
+router.get('/by-sound/:videoId', optionalAuth, async (req, res) => {
+  try {
+    const filter = { ...visibilityFilter(req), $or: [{ _id: req.params.videoId }, { audioOf: req.params.videoId }] };
+    const list = await Video.find(filter).sort({ likes: -1, createdAt: -1 }).limit(60).populate('creator', POPULATE_CREATOR);
+    res.json(list.map(decorateVideo));
+  } catch {
+    res.status(500).json({ msg: 'Server error' });
+  }
+});
+
+// GET trending sounds (videos referenced as audioOf or original sounds with audioUrl)
+router.get('/sounds/trending', async (req, res) => {
+  try {
+    const oneWeekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const agg = await Video.aggregate([
+      { $match: { audioOf: { $ne: null }, createdAt: { $gte: oneWeekAgo } } },
+      { $group: { _id: '$audioOf', uses: { $sum: 1 } } },
+      { $sort: { uses: -1 } },
+      { $limit: 20 }
+    ]);
+    const ids = agg.map(a => a._id);
+    const sources = await Video.find({ _id: { $in: ids } }).select('title creatorName videoUrl youtubeId').lean();
+    const byId = Object.fromEntries(sources.map(s => [String(s._id), s]));
+    res.json(agg.map(a => ({ videoId: a._id, uses: a.uses, source: byId[String(a._id)] || null })));
+  } catch {
     res.status(500).json({ msg: 'Server error' });
   }
 });
