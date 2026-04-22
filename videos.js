@@ -33,6 +33,18 @@ const normalizeCloudinaryUrl = (url) => {
   return url.replace('/upload/', '/upload/f_mp4,vc_h264,q_auto/');
 };
 
+// Cloudinary auto-derives an .mp3 sibling for any uploaded video — just
+// strip the f_mp4 transformation and rename the extension. Returns '' if
+// the URL isn't a Cloudinary upload (e.g. YouTube videos have no audio asset).
+const deriveCloudinaryAudioUrl = (videoUrl) => {
+  if (!videoUrl || typeof videoUrl !== 'string') return '';
+  if (!videoUrl.includes('res.cloudinary.com') || !videoUrl.includes('/upload/')) return '';
+  // Drop any /upload/<transforms>/ block so we get the raw asset, then
+  // change the file extension to .mp3.
+  let stripped = videoUrl.replace(/\/upload\/[^/]+\//, '/upload/');
+  return stripped.replace(/\.(mp4|mov|webm|m4v)(\?.*)?$/i, '.mp3$2');
+};
+
 const decorateVideo = (v) => {
   if (!v) return v;
   const obj = typeof v.toObject === 'function' ? v.toObject() : v;
@@ -293,7 +305,7 @@ router.get('/:id/remixes', async (req, res) => {
 // POST submit video
 router.post('/', auth, async (req, res) => {
   try {
-    const { title, youtubeUrl, videoUrl, category, monetized, caption, durationSec, remixOf, isPrivate } = req.body || {};
+    const { title, youtubeUrl, videoUrl, category, monetized, caption, durationSec, remixOf, duetOf, originalSoundOf, isPrivate } = req.body || {};
     if (!title || !title.trim()) return res.status(400).json({ msg: 'Title is required' });
     const youtubeId = getYoutubeId(youtubeUrl);
     if (!youtubeId && !videoUrl) return res.status(400).json({ msg: 'Please provide a YouTube URL or upload a video' });
@@ -304,6 +316,30 @@ router.post('/', auth, async (req, res) => {
       const original = await Video.findById(remixOf).select('_id creator title');
       if (!original) return res.status(400).json({ msg: 'Original video for remix not found' });
       remixOfId = original._id;
+    }
+
+    let duetOfId = null;
+    if (duetOf) {
+      if (!isValidId(duetOf)) return res.status(400).json({ msg: 'Invalid duet source id' });
+      const original = await Video.findById(duetOf).select('_id creator title audioUrl originalSoundOf');
+      if (!original) return res.status(400).json({ msg: 'Original video for duet not found' });
+      duetOfId = original._id;
+    }
+
+    // Resolve the "sound originator" — the video that owns the audio. For
+    // duets this defaults to the duet source. For "use this sound" uploads
+    // the client can pass originalSoundOf explicitly. We always normalise
+    // to the actual originating video (transitive), so chains of duets all
+    // attribute back to the same source.
+    let soundOriginatorId = null;
+    if (originalSoundOf) {
+      if (!isValidId(originalSoundOf)) return res.status(400).json({ msg: 'Invalid sound source id' });
+      const sound = await Video.findById(originalSoundOf).select('_id originalSoundOf');
+      if (!sound) return res.status(400).json({ msg: 'Original sound not found' });
+      soundOriginatorId = sound.originalSoundOf || sound._id;
+    } else if (duetOfId) {
+      const dsrc = await Video.findById(duetOfId).select('originalSoundOf');
+      soundOriginatorId = (dsrc && dsrc.originalSoundOf) || duetOfId;
     }
 
     const creator = await User.findById(req.user.id).select('username displayName notifyOnRemix');
@@ -335,9 +371,26 @@ router.post('/', auth, async (req, res) => {
       isPrivate: !!isPrivate,
       hashtags: extractHashtags(cleanTitle, cleanCaption),
       remixOf: remixOfId,
+      duetOf: duetOfId,
+      originalSoundOf: soundOriginatorId,
+      // Direct uploads get an mp3 derivative for free from Cloudinary.
+      audioUrl: deriveCloudinaryAudioUrl(videoUrl || ''),
       promptDate
     });
     await video.save();
+
+    // Bump duet count + sound use count without blocking the response.
+    if (duetOfId) {
+      Video.updateOne({ _id: duetOfId }, { $inc: { duetCount: 1 } }).catch(err => console.error('duet bump failed:', err.message));
+      Video.findById(duetOfId).select('creator title').then(orig => {
+        if (orig && String(orig.creator) !== req.user.id) {
+          notify({ recipient: String(orig.creator), sender: req.user.id, type: 'duet', videoTitle: orig.title, videoId: String(orig._id), snippet: cleanTitle });
+        }
+      }).catch(() => {});
+    }
+    if (soundOriginatorId) {
+      Video.updateOne({ _id: soundOriginatorId }, { $inc: { soundUseCount: 1 } }).catch(err => console.error('sound bump failed:', err.message));
+    }
 
     if (remixOfId) {
       const original = await Video.findByIdAndUpdate(remixOfId, { $inc: { remixCount: 1 } }, { new: true }).select('creator title');

@@ -30,7 +30,9 @@ const promptRoutes = require('./prompts');
 const reportRoutes = require('./reports');
 const liveRoutes = require('./live');
 const pushRoutes = require('./push');
+const soundRoutes = require('./sounds');
 const { mountLiveSignal } = require('./liveSignal');
+const { mountDmSignal } = require('./dmSignal');
 const http = require('http');
 
 connectDB();
@@ -110,6 +112,10 @@ app.use('/api/prompts', promptRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/live', liveRoutes);
 app.use('/api/push', pushRoutes);
+app.use('/api/sounds', soundRoutes);
+// DM media uploads can be slightly larger than text — separate limiter.
+app.post('/api/messages/:userId/media', writeLimiter);
+app.post('/api/messages/react/:msgId', writeLimiter);
 
 // Catch-all 404 for unknown API routes
 app.use('/api', (req, res) => res.status(404).json({ msg: 'Not found' }));
@@ -123,4 +129,5 @@ app.use((err, req, res, _next) => {
 const PORT = process.env.PORT || 5000;
 const server = http.createServer(app);
 mountLiveSignal(server);
+mountDmSignal(server);
 server.listen(PORT, () => console.log('Cheka server running on port ' + PORT));

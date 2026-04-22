@@ -20,6 +20,17 @@ const VideoSchema = new mongoose.Schema({
   // Remix / Stitch-style reaction
   remixOf: { type: mongoose.Schema.Types.ObjectId, ref: 'Video', default: null, index: true },
   remixCount: { type: Number, default: 0 },
+  // Duet — side-by-side recording paired with another video's sound.
+  // duetOf points to the original Video; we count duets on the original.
+  duetOf: { type: mongoose.Schema.Types.ObjectId, ref: 'Video', default: null, index: true },
+  duetCount: { type: Number, default: 0 },
+  // Audio derivation — Cloudinary auto-derives an .mp3 sibling for direct
+  // uploads. `audioUrl` is the playable mp3; `originalSoundOf` points to the
+  // Video that ORIGINATED the sound (null for original sounds, set for duets
+  // and other "use this sound" uploads).
+  audioUrl: { type: String, default: '' },
+  originalSoundOf: { type: mongoose.Schema.Types.ObjectId, ref: 'Video', default: null, index: true },
+  soundUseCount: { type: Number, default: 0 },
   // Hashtags parsed from caption (lowercased, no #). Indexed for hashtag pages.
   hashtags: { type: [String], default: [], index: true },
   // Saves / bookmarks
