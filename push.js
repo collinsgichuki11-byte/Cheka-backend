@@ -1,67 +1,45 @@
 const express = require('express');
 const router = express.Router();
-const jwt = require('jsonwebtoken');
 const PushSubscription = require('./PushSubscription');
-const webpush = require('./webpush');
+const { auth } = require('./lib/auth');
+const { publicKey } = require('./lib/pushSender');
 
-const auth = (req, res, next) => {
-  const token = req.header('Authorization')?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ msg: 'No token' });
-  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
-  catch { res.status(401).json({ msg: 'Invalid token' }); }
-};
-
-// GET the VAPID public key — clients need this to subscribe
-router.get('/vapid-public-key', (req, res) => {
-  res.json({ publicKey: webpush.publicKey(), enabled: webpush.isConfigured() });
+// GET /api/push/public-key — clients fetch this to call subscribe()
+router.get('/public-key', (req, res) => {
+  res.json({ key: publicKey() });
 });
 
-// POST subscribe
+// POST /api/push/subscribe — register a new push subscription for the user
 router.post('/subscribe', auth, async (req, res) => {
   try {
-    const { endpoint, keys } = req.body || {};
-    if (!endpoint || !keys?.p256dh || !keys?.auth) {
-      return res.status(400).json({ msg: 'Bad subscription' });
+    const sub = req.body?.subscription;
+    if (!sub || !sub.endpoint || !sub.keys?.p256dh || !sub.keys?.auth) {
+      return res.status(400).json({ msg: 'Invalid subscription' });
     }
+    const ua = (req.header('User-Agent') || '').slice(0, 200);
     await PushSubscription.findOneAndUpdate(
-      { endpoint },
-      {
-        $set: {
-          user: String(req.user.id),
-          endpoint,
-          keys: { p256dh: keys.p256dh, auth: keys.auth },
-          ua: (req.header('User-Agent') || '').slice(0, 200)
-        }
-      },
-      { upsert: true, new: true }
+      { endpoint: sub.endpoint },
+      { user: String(req.user.id), endpoint: sub.endpoint, keys: sub.keys, ua },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
     );
     res.json({ ok: true });
   } catch (err) {
+    console.error('POST /push/subscribe failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
 
-// POST unsubscribe
+// POST /api/push/unsubscribe — remove a subscription by endpoint
 router.post('/unsubscribe', auth, async (req, res) => {
   try {
-    const { endpoint } = req.body || {};
-    if (!endpoint) return res.status(400).json({ msg: 'Missing endpoint' });
+    const endpoint = req.body?.endpoint;
+    if (!endpoint) return res.status(400).json({ msg: 'Endpoint required' });
     await PushSubscription.deleteOne({ endpoint, user: String(req.user.id) });
     res.json({ ok: true });
-  } catch {
+  } catch (err) {
+    console.error('POST /push/unsubscribe failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
-});
-
-// POST test (auth) — send self a test push
-router.post('/test', auth, async (req, res) => {
-  const r = await webpush.sendPushTo(req.user.id, {
-    type: 'test',
-    title: 'Push is working ✅',
-    body: 'You will now get notified on Cheka.',
-    url: '/notifications.html'
-  });
-  res.json(r);
 });
 
 module.exports = router;

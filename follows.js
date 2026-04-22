@@ -1,20 +1,16 @@
 const express = require('express');
 const router = express.Router();
-const jwt = require('jsonwebtoken');
 const Follow = require('./Follow');
 const User = require('./User');
 const Notification = require('./Notification');
+const { auth, isValidId } = require('./lib/auth');
 
-const auth = (req, res, next) => {
-  const token = req.header('Authorization')?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ msg: 'No token' });
-  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
-  catch { res.status(401).json({ msg: 'Invalid token' }); }
-};
+const valid = (id) => isValidId(id);
 
 // POST follow/unfollow a creator
 router.post('/:creatorId', auth, async (req, res) => {
   try {
+    if (!valid(req.params.creatorId)) return res.status(400).json({ msg: 'Invalid user id' });
     if (req.params.creatorId === req.user.id) {
       return res.status(400).json({ msg: 'Cannot follow yourself' });
     }
@@ -35,11 +31,12 @@ router.post('/:creatorId', auth, async (req, res) => {
           type: 'follow',
           videoTitle: '',
           videoId: ''
-        }).catch(() => {});
+        }).catch(err => console.error('notify follow failed:', err.message));
       }
       res.json({ following: true });
     }
   } catch (err) {
+    console.error('POST /follows/:creatorId failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -47,9 +44,11 @@ router.post('/:creatorId', auth, async (req, res) => {
 // GET followers count for a user
 router.get('/:userId/count', async (req, res) => {
   try {
+    if (!valid(req.params.userId)) return res.status(400).json({ msg: 'Invalid user id' });
     const count = await Follow.countDocuments({ following: req.params.userId });
     res.json({ count });
   } catch (err) {
+    console.error('GET /follows/:userId/count failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -57,9 +56,11 @@ router.get('/:userId/count', async (req, res) => {
 // GET following count for a user
 router.get('/:userId/following-count', async (req, res) => {
   try {
+    if (!valid(req.params.userId)) return res.status(400).json({ msg: 'Invalid user id' });
     const count = await Follow.countDocuments({ follower: req.params.userId });
     res.json({ count });
   } catch (err) {
+    console.error('GET /follows/:userId/following-count failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -67,12 +68,14 @@ router.get('/:userId/following-count', async (req, res) => {
 // GET check if current user is following someone
 router.get('/:creatorId/check', auth, async (req, res) => {
   try {
+    if (!valid(req.params.creatorId)) return res.status(400).json({ msg: 'Invalid user id' });
     const existing = await Follow.findOne({
       follower: req.user.id,
       following: req.params.creatorId
     });
     res.json({ following: !!existing });
   } catch (err) {
+    console.error('GET /follows/:creatorId/check failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -80,11 +83,13 @@ router.get('/:creatorId/check', auth, async (req, res) => {
 // GET list of user objects who follow a user
 router.get('/:userId/followers-list', auth, async (req, res) => {
   try {
+    if (!valid(req.params.userId)) return res.status(400).json({ msg: 'Invalid user id' });
     const follows = await Follow.find({ following: req.params.userId });
     const followerIds = follows.map(f => f.follower);
     const users = await User.find({ _id: { $in: followerIds } }).select('_id username displayName isVerified');
     res.json(users);
   } catch (err) {
+    console.error('GET /follows/:userId/followers-list failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -92,11 +97,13 @@ router.get('/:userId/followers-list', auth, async (req, res) => {
 // GET list of user objects a user is following
 router.get('/:userId/following-list', auth, async (req, res) => {
   try {
+    if (!valid(req.params.userId)) return res.status(400).json({ msg: 'Invalid user id' });
     const follows = await Follow.find({ follower: req.params.userId });
     const followingIds = follows.map(f => f.following);
     const users = await User.find({ _id: { $in: followingIds } }).select('_id username displayName isVerified');
     res.json(users);
   } catch (err) {
+    console.error('GET /follows/:userId/following-list failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -107,6 +114,7 @@ router.get('/my/following', auth, async (req, res) => {
     const follows = await Follow.find({ follower: req.user.id });
     res.json(follows.map(f => f.following));
   } catch (err) {
+    console.error('GET /follows/my/following failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });

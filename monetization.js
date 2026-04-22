@@ -1,17 +1,10 @@
 const express = require('express');
 const router = express.Router();
-const jwt = require('jsonwebtoken');
 const User = require('./User');
 const Video = require('./Video');
 const Follow = require('./Follow');
 const PlatformSettings = require('./PlatformSettings');
-
-const auth = (req, res, next) => {
-  const token = req.header('Authorization')?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ msg: 'No token' });
-  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
-  catch { res.status(401).json({ msg: 'Invalid token' }); }
-};
+const { auth, isValidId } = require('./lib/auth');
 
 // Meta-inspired eligibility rules adapted for Cheka.
 // Mirrors Facebook In-Stream Ads / Reels Play criteria.
@@ -38,6 +31,8 @@ async function computeEligibility(userId) {
   const recentVideos = videos.filter(v => new Date(v.createdAt) >= sixtyDaysAgo);
   const totalViews60d = recentVideos.reduce((s, v) => s + (v.views || 0), 0);
   const ageDays = Math.floor((Date.now() - new Date(user.createdAt)) / (24 * 3600 * 1000));
+  // strikes is a real field on the User model now (defaults to 0).
+  const userStrikes = Number(user.strikes || 0);
 
   const criteria = [
     { key: 'followers', label: `${RULES.minFollowers.toLocaleString()}+ followers`,
@@ -53,8 +48,8 @@ async function computeEligibility(userId) {
       current: ageDays, required: RULES.minAccountAgeDays,
       met: ageDays >= RULES.minAccountAgeDays },
     { key: 'strikes', label: 'No community guideline strikes',
-      current: user.strikes || 0, required: 0,
-      met: (user.strikes || 0) <= RULES.maxStrikes }
+      current: userStrikes, required: 0,
+      met: userStrikes <= RULES.maxStrikes }
   ];
 
   const platformOn = settings ? !!settings.monetizationEnabled : false;
@@ -78,13 +73,15 @@ router.get('/me', auth, async (req, res) => {
     const result = await computeEligibility(req.user.id);
     res.json(result);
   } catch (err) {
+    console.error('GET /monetization/me failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
 
-// GET any user's eligibility (admin only)
+// GET any user's eligibility (admin only, or self)
 router.get('/check/:userId', auth, async (req, res) => {
   try {
+    if (!isValidId(req.params.userId)) return res.status(400).json({ msg: 'Invalid user id' });
     const me = await User.findById(req.user.id);
     if (!me?.isAdmin && req.user.id !== req.params.userId) {
       return res.status(403).json({ msg: 'Not authorized' });
@@ -92,6 +89,7 @@ router.get('/check/:userId', auth, async (req, res) => {
     const result = await computeEligibility(req.params.userId);
     res.json(result);
   } catch (err) {
+    console.error('GET /monetization/check/:userId failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -110,6 +108,7 @@ router.post('/apply', auth, async (req, res) => {
     ).select('-password');
     res.json({ msg: 'Application submitted for review', user });
   } catch (err) {
+    console.error('POST /monetization/apply failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });

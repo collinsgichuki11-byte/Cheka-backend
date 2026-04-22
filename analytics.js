@@ -1,8 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const jwt = require('jsonwebtoken');
 const Analytics = require('./Analytics');
 const User = require('./User');
+const { auth, optionalAuth } = require('./lib/auth');
 
 const ALLOWED_TYPES = new Set([
   'page_view', 'signup', 'login', 'video_view', 'video_like', 'video_unlike',
@@ -10,27 +10,15 @@ const ALLOWED_TYPES = new Set([
   'ad_impression', 'ad_click', 'share'
 ]);
 
-const optionalAuth = (req, res, next) => {
-  const token = req.header('Authorization')?.replace('Bearer ', '');
-  if (!token) { req.user = null; return next(); }
-  try { req.user = jwt.verify(token, process.env.JWT_SECRET); }
-  catch { req.user = null; }
-  next();
-};
-
-const requireAuth = (req, res, next) => {
-  const token = req.header('Authorization')?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ msg: 'No token' });
-  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
-  catch { res.status(401).json({ msg: 'Invalid token' }); }
-};
-
 const adminOnly = async (req, res, next) => {
   try {
     const user = await User.findById(req.user.id);
     if (!user || !user.isAdmin) return res.status(403).json({ msg: 'Admin only' });
     next();
-  } catch { res.status(500).json({ msg: 'Server error' }); }
+  } catch (err) {
+    console.error('analytics adminOnly failed:', err);
+    res.status(500).json({ msg: 'Server error' });
+  }
 };
 
 const sanitizeMeta = (meta) => {
@@ -61,7 +49,8 @@ router.post('/event', optionalAuth, async (req, res) => {
     });
     await event.save();
     res.json({ ok: true });
-  } catch {
+  } catch (err) {
+    console.error('POST /analytics/event failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -85,13 +74,14 @@ router.post('/events', optionalAuth, async (req, res) => {
       }));
     if (docs.length) await Analytics.insertMany(docs, { ordered: false });
     res.json({ ok: true, saved: docs.length });
-  } catch {
+  } catch (err) {
+    console.error('POST /analytics/events failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
 
 // GET /api/analytics/summary — admin dashboard data
-router.get('/summary', requireAuth, adminOnly, async (req, res) => {
+router.get('/summary', auth, adminOnly, async (req, res) => {
   try {
     const now = new Date();
     const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
@@ -138,125 +128,68 @@ router.get('/summary', requireAuth, adminOnly, async (req, res) => {
       recent,
       activeUsers24h: activeUsers24h.length
     });
-  } catch {
-    res.status(500).json({ msg: 'Server error' });
-  }
-});
-
-// GET creator dashboard — 28-day timeseries + best posting hour heatmap + top hashtags + summary
-router.get('/creator/me', requireAuth, async (req, res) => {
-  try {
-    const Video = require('./Video');
-    const me = req.user.id;
-    const since = new Date(Date.now() - 28 * 24 * 60 * 60 * 1000);
-
-    const videos = await Video.find({ creator: me }).select('_id title views likes loops saves shares reposts remixCount estimatedEarnings tipsReceived hashtags createdAt durationSec').lean();
-
-    // Per-day totals from analytics events for this creator's videos
-    const videoIds = videos.map(v => String(v._id));
-    const events = await Analytics.find({
-      type: { $in: ['video_view','video_like','video_loop','video_share'] },
-      video: { $in: videoIds },
-      createdAt: { $gte: since }
-    }).select('type video createdAt').lean();
-
-    // Day buckets (YYYY-MM-DD)
-    const dayBuckets = {};
-    for (let i = 0; i < 28; i++) {
-      const d = new Date(Date.now() - i * 24 * 60 * 60 * 1000);
-      const key = d.toISOString().slice(0, 10);
-      dayBuckets[key] = { date: key, views: 0, likes: 0, loops: 0, shares: 0 };
-    }
-    for (const ev of events) {
-      const k = new Date(ev.createdAt).toISOString().slice(0, 10);
-      if (!dayBuckets[k]) continue;
-      if (ev.type === 'video_view') dayBuckets[k].views++;
-      else if (ev.type === 'video_like') dayBuckets[k].likes++;
-      else if (ev.type === 'video_loop') dayBuckets[k].loops++;
-      else if (ev.type === 'video_share') dayBuckets[k].shares++;
-    }
-    const timeseries = Object.values(dayBuckets).sort((a, b) => a.date.localeCompare(b.date));
-
-    // Best posting hour: count of cumulative views grouped by upload hour
-    const hourBuckets = Array.from({ length: 24 }, (_, h) => ({ hour: h, count: 0, views: 0 }));
-    for (const v of videos) {
-      const h = new Date(v.createdAt).getHours();
-      hourBuckets[h].count++;
-      hourBuckets[h].views += v.views || 0;
-    }
-
-    // Top hashtags
-    const tagMap = {};
-    for (const v of videos) {
-      for (const t of v.hashtags || []) {
-        tagMap[t] = (tagMap[t] || 0) + (v.views || 0) + (v.likes || 0) * 3;
-      }
-    }
-    const topHashtags = Object.entries(tagMap).sort((a, b) => b[1] - a[1]).slice(0, 10).map(([tag, score]) => ({ tag, score }));
-
-    // Top videos by engagement
-    const topVideos = [...videos].map(v => ({
-      ...v,
-      engagement: (v.views || 0) + (v.likes || 0) * 5 + (v.loops || 0) * 0.5 + (v.saves || 0) * 4
-    })).sort((a, b) => b.engagement - a.engagement).slice(0, 10);
-
-    // Totals
-    const totals = videos.reduce((acc, v) => {
-      acc.videos++;
-      acc.views += v.views || 0;
-      acc.likes += v.likes || 0;
-      acc.loops += v.loops || 0;
-      acc.saves += v.saves || 0;
-      acc.shares += v.shares || 0;
-      acc.reposts += v.reposts || 0;
-      acc.remixes += v.remixCount || 0;
-      acc.earnings += v.estimatedEarnings || 0;
-      acc.tips += v.tipsReceived || 0;
-      return acc;
-    }, { videos: 0, views: 0, likes: 0, loops: 0, saves: 0, shares: 0, reposts: 0, remixes: 0, earnings: 0, tips: 0 });
-    totals.earnings = Number(totals.earnings.toFixed(4));
-
-    res.json({ totals, timeseries, hourBuckets, topHashtags, topVideos });
   } catch (err) {
-    console.error('creator analytics', err.message);
+    console.error('GET /analytics/summary failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
 
-// GET per-video analytics (must be the owner)
-router.get('/video/:id', requireAuth, async (req, res) => {
+// GET /api/analytics/creator/me — analytics for the authed user's own videos
+router.get('/creator/me', auth, async (req, res) => {
   try {
     const Video = require('./Video');
-    const v = await Video.findById(req.params.id).lean();
-    if (!v) return res.status(404).json({ msg: 'Not found' });
-    if (String(v.creator) !== req.user.id) return res.status(403).json({ msg: 'Not your video' });
+    const Follow = require('./Follow');
+    const Comment = require('./Comment');
+    const mongoose = require('mongoose');
+    const meObjectId = new mongoose.Types.ObjectId(req.user.id);
 
-    const since = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
-    const events = await Analytics.find({
-      video: String(v._id),
-      type: { $in: ['video_view','video_like','video_loop','video_share'] },
-      createdAt: { $gte: since }
-    }).select('type createdAt').lean();
+    const now = new Date();
+    const dayAgo = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+    const weekAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+    const monthAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
-    const buckets = {};
-    for (let i = 0; i < 14; i++) {
-      const k = new Date(Date.now() - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-      buckets[k] = { date: k, views: 0, likes: 0, loops: 0, shares: 0 };
-    }
-    for (const ev of events) {
-      const k = new Date(ev.createdAt).toISOString().slice(0, 10);
-      if (!buckets[k]) continue;
-      if (ev.type === 'video_view') buckets[k].views++;
-      else if (ev.type === 'video_like') buckets[k].likes++;
-      else if (ev.type === 'video_loop') buckets[k].loops++;
-      else if (ev.type === 'video_share') buckets[k].shares++;
-    }
+    const [videos, followerCount, totals] = await Promise.all([
+      Video.find({ creator: meObjectId }).select('_id title createdAt views likes saves shares reposts remixCount loops estimatedEarnings').lean(),
+      Follow.countDocuments({ following: req.user.id }),
+      Video.aggregate([
+        { $match: { creator: meObjectId } },
+        { $group: {
+          _id: null,
+          views: { $sum: '$views' }, likes: { $sum: '$likes' },
+          saves: { $sum: '$saves' }, shares: { $sum: '$shares' },
+          reposts: { $sum: '$reposts' }, remixes: { $sum: '$remixCount' },
+          loops: { $sum: '$loops' }, earnings: { $sum: '$estimatedEarnings' }
+        } }
+      ])
+    ]);
+
+    const videoIds = videos.map(v => v._id);
+
+    const [views7d, views24h, viewsByDay, topByViews] = await Promise.all([
+      Analytics.countDocuments({ type: 'video_view', video: { $in: videoIds }, createdAt: { $gte: weekAgo } }),
+      Analytics.countDocuments({ type: 'video_view', video: { $in: videoIds }, createdAt: { $gte: dayAgo } }),
+      Analytics.aggregate([
+        { $match: { type: 'video_view', video: { $in: videoIds }, createdAt: { $gte: monthAgo } } },
+        { $group: { _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } }, count: { $sum: 1 } } },
+        { $sort: { _id: 1 } }
+      ]),
+      Video.find({ creator: meObjectId }).sort({ views: -1 }).limit(10)
+        .select('_id title views likes saves shares createdAt').lean()
+    ]);
+
+    const sum = totals[0] || { views: 0, likes: 0, saves: 0, shares: 0, reposts: 0, remixes: 0, loops: 0, earnings: 0 };
+
     res.json({
-      video: { _id: v._id, title: v.title, views: v.views, likes: v.likes, loops: v.loops, saves: v.saves, shares: v.shares, reposts: v.reposts, remixCount: v.remixCount, estimatedEarnings: v.estimatedEarnings, tipsReceived: v.tipsReceived, durationSec: v.durationSec },
-      timeseries: Object.values(buckets).sort((a, b) => a.date.localeCompare(b.date))
+      videoCount: videos.length,
+      followerCount,
+      totals: sum,
+      views7d,
+      views24h,
+      viewsByDay,
+      topByViews
     });
   } catch (err) {
-    console.error('video analytics', err.message);
+    console.error('GET /analytics/creator/me failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });

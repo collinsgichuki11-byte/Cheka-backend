@@ -35,11 +35,10 @@ const userPayload = (user) => ({
 // SIGNUP
 router.post('/signup', async (req, res) => {
   try {
-    let { username, email, password, ref } = req.body || {};
+    let { username, email, password } = req.body || {};
     username = (username || '').trim();
     email = (email || '').trim().toLowerCase();
     password = password || '';
-    ref = (ref || '').trim().toLowerCase();
 
     if (!username || username.length < 3 || username.length > 24) {
       return res.status(400).json({ msg: 'Username must be 3–24 characters' });
@@ -61,35 +60,14 @@ router.post('/signup', async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, salt);
 
     const isAdmin = isAdminEmail(email);
-
-    // Look up referrer (case-insensitive code lookup) — soft fail if missing.
-    let referrer = null;
-    if (ref) {
-      try { referrer = await User.findOne({ referralCode: ref }).select('_id'); } catch (_) {}
-    }
-
-    const user = new User({
-      username,
-      email,
-      password: hashedPassword,
-      isAdmin,
-      isVerified: isAdmin,
-      referredBy: referrer ? String(referrer._id) : ''
-    });
+    const user = new User({ username, email, password: hashedPassword, isAdmin, isVerified: isAdmin });
     await user.save();
 
-    // Reward referrer: +50 coins and increment count, plus a 7-day boost.
-    if (referrer) {
-      User.findByIdAndUpdate(referrer._id, {
-        $inc: { coins: 50, referralCount: 1 },
-        $set: { referralBoostUntil: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000) }
-      }).catch(() => {});
-    }
-
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    trackEvent('signup', { user: user._id, meta: { referredBy: referrer ? String(referrer._id) : null } });
+    trackEvent('signup', { user: user._id });
     res.json({ token, user: userPayload(user) });
   } catch (err) {
+    console.error('POST /auth/signup failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -125,6 +103,7 @@ router.post('/login', async (req, res) => {
     trackEvent('login', { user: user._id });
     res.json({ token, user: userPayload(user) });
   } catch (err) {
+    console.error('POST /auth/login failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });

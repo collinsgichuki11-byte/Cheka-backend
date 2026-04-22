@@ -1,9 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const jwt = require('jsonwebtoken');
 const User = require('./User');
 const Report = require('./Report');
-const Notification = require('./Notification');
+const { auth, isValidId } = require('./lib/auth');
 
 const ADMIN_EMAILS = new Set(
   ['youanadanielle@gmail.com']
@@ -11,17 +10,6 @@ const ADMIN_EMAILS = new Set(
     .filter(Boolean)
 );
 const isAdminEmail = (email) => ADMIN_EMAILS.has((email || '').toLowerCase());
-
-const auth = (req, res, next) => {
-  const token = req.header('Authorization')?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ msg: 'No token' });
-  try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ msg: 'Invalid token' });
-  }
-};
 
 // GET /api/users/me — own full profile (with admin self-heal).
 router.get('/me', auth, async (req, res) => {
@@ -39,7 +27,8 @@ router.get('/me', auth, async (req, res) => {
       await user.save();
     }
     res.json(user);
-  } catch {
+  } catch (err) {
+    console.error('GET /users/me failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -63,7 +52,8 @@ router.patch('/me', auth, async (req, res) => {
     const user = await User.findByIdAndUpdate(req.user.id, { $set: update }, { new: true }).select('-password');
     if (!user) return res.status(404).json({ msg: 'User not found' });
     res.json(user);
-  } catch {
+  } catch (err) {
+    console.error('PATCH /users/me failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -71,6 +61,7 @@ router.patch('/me', auth, async (req, res) => {
 // POST /api/users/block/:userId — block / unblock
 router.post('/block/:userId', auth, async (req, res) => {
   try {
+    if (!isValidId(req.params.userId)) return res.status(400).json({ msg: 'Invalid user id' });
     if (req.params.userId === req.user.id) return res.status(400).json({ msg: 'Cannot block yourself' });
     const me = await User.findById(req.user.id);
     if (!me) return res.status(404).json({ msg: 'User not found' });
@@ -88,7 +79,8 @@ router.post('/block/:userId', auth, async (req, res) => {
     me.blocked = [...blockedSet];
     await me.save();
     res.json({ blocked });
-  } catch {
+  } catch (err) {
+    console.error('POST /users/block/:userId failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -100,7 +92,8 @@ router.get('/blocked/list', auth, async (req, res) => {
     if (!me?.blocked?.length) return res.json([]);
     const users = await User.find({ _id: { $in: me.blocked } }).select('_id username displayName isVerified');
     res.json(users);
-  } catch {
+  } catch (err) {
+    console.error('GET /users/blocked/list failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -110,7 +103,7 @@ router.post('/report', auth, async (req, res) => {
   try {
     const { targetType, targetId, reason } = req.body || {};
     if (!['video','comment','user'].includes(targetType)) return res.status(400).json({ msg: 'Invalid target type' });
-    if (!targetId) return res.status(400).json({ msg: 'Missing target id' });
+    if (!targetId || !isValidId(targetId)) return res.status(400).json({ msg: 'Invalid target id' });
     const cleanReason = String(reason || '').trim().slice(0, 200);
     if (!cleanReason) return res.status(400).json({ msg: 'Reason required' });
     await Report.create({ reporter: req.user.id, targetType, targetId, reason: cleanReason });
@@ -119,7 +112,8 @@ router.post('/report', auth, async (req, res) => {
       await Video.findByIdAndUpdate(targetId, { $inc: { reportCount: 1 } });
     }
     res.json({ msg: 'Report submitted' });
-  } catch {
+  } catch (err) {
+    console.error('POST /users/report failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -134,7 +128,8 @@ router.get('/', auth, async (req, res) => {
       .limit(20)
       .select('_id username displayName isVerified monetizationEnabled monetizationStatus isPrivate');
     res.json(users);
-  } catch {
+  } catch (err) {
+    console.error('GET /users failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -142,10 +137,12 @@ router.get('/', auth, async (req, res) => {
 // GET /api/users/:userId — public profile
 router.get('/:userId', async (req, res) => {
   try {
+    if (!isValidId(req.params.userId)) return res.status(400).json({ msg: 'Invalid user id' });
     const user = await User.findById(req.params.userId).select('-password -email -blocked -notifyOnLike -notifyOnComment -notifyOnFollow -notifyOnRemix');
     if (!user) return res.status(404).json({ msg: 'User not found' });
     res.json(user);
-  } catch {
+  } catch (err) {
+    console.error('GET /users/:userId failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });

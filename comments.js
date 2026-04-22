@@ -1,22 +1,12 @@
 const express = require('express');
 const router = express.Router();
-const jwt = require('jsonwebtoken');
-const mongoose = require('mongoose');
 const Comment = require('./Comment');
 const User = require('./User');
 const Video = require('./Video');
 const Notification = require('./Notification');
-
-const auth = (req, res, next) => {
-  const token = req.header('Authorization')?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ msg: 'No token' });
-  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
-  catch { res.status(401).json({ msg: 'Invalid token' }); }
-};
+const { auth, isValidId } = require('./lib/auth');
 
 const notify = (data) => { Notification.create(data).catch(err => console.error('notify failed:', err.message)); };
-
-const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
 
 // GET top-level comments for a video (with reply counts) — sorted: pinned first, then newest
 router.get('/:videoId', async (req, res) => {

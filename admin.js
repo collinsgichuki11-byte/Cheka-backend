@@ -1,21 +1,10 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
 const User = require('./User');
 const Video = require('./Video');
 const PlatformSettings = require('./PlatformSettings');
+const { auth, isValidId } = require('./lib/auth');
 
 const router = express.Router();
-
-const auth = (req, res, next) => {
-  const token = req.header('Authorization')?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ msg: 'No token' });
-  try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET);
-    next();
-  } catch {
-    res.status(401).json({ msg: 'Invalid token' });
-  }
-};
 
 const getSettings = async () => {
   let settings = await PlatformSettings.findOne({ key: 'main' });
@@ -24,10 +13,15 @@ const getSettings = async () => {
 };
 
 const adminOnly = async (req, res, next) => {
-  const user = await User.findById(req.user.id);
-  if (!user || !user.isAdmin) return res.status(403).json({ msg: 'Admin only' });
-  req.admin = user;
-  next();
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user || !user.isAdmin) return res.status(403).json({ msg: 'Admin only' });
+    req.admin = user;
+    next();
+  } catch (err) {
+    console.error('adminOnly check failed:', err);
+    res.status(500).json({ msg: 'Server error' });
+  }
 };
 
 router.get('/ads', async (req, res) => {
@@ -40,7 +34,8 @@ router.get('/ads', async (req, res) => {
       adCta: settings.adCta,
       adUrl: settings.adUrl
     });
-  } catch {
+  } catch (err) {
+    console.error('GET /admin/ads failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
@@ -62,14 +57,15 @@ router.get('/dashboard', auth, adminOnly, async (req, res) => {
         monetizedCreators: users.filter(u => u.monetizationEnabled).length
       }
     });
-  } catch {
+  } catch (err) {
+    console.error('GET /admin/dashboard failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
 
 router.patch('/ads', auth, adminOnly, async (req, res) => {
   try {
-    const { adsEnabled, monetizationEnabled, platformCpm, adTitle, adBody, adCta, adUrl } = req.body;
+    const { adsEnabled, monetizationEnabled, platformCpm, adTitle, adBody, adCta, adUrl } = req.body || {};
     const update = { updatedAt: new Date() };
     if (adsEnabled !== undefined) update.adsEnabled = !!adsEnabled;
     if (monetizationEnabled !== undefined) update.monetizationEnabled = !!monetizationEnabled;
@@ -85,14 +81,16 @@ router.patch('/ads', auth, adminOnly, async (req, res) => {
       { new: true, upsert: true }
     );
     res.json(settings);
-  } catch {
+  } catch (err) {
+    console.error('PATCH /admin/ads failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
 
 router.patch('/users/:id', auth, adminOnly, async (req, res) => {
   try {
-    const { isVerified, monetizationEnabled, monetizationStatus, isAdmin } = req.body;
+    if (!isValidId(req.params.id)) return res.status(400).json({ msg: 'Invalid user id' });
+    const { isVerified, monetizationEnabled, monetizationStatus, isAdmin } = req.body || {};
     const update = {};
     if (isVerified !== undefined) update.isVerified = !!isVerified;
     if (monetizationEnabled !== undefined) update.monetizationEnabled = !!monetizationEnabled;
@@ -105,7 +103,8 @@ router.patch('/users/:id', auth, adminOnly, async (req, res) => {
     const user = await User.findByIdAndUpdate(req.params.id, { $set: update }, { new: true }).select('-password');
     if (!user) return res.status(404).json({ msg: 'User not found' });
     res.json(user);
-  } catch {
+  } catch (err) {
+    console.error('PATCH /admin/users/:id failed:', err);
     res.status(500).json({ msg: 'Server error' });
   }
 });
