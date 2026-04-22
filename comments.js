@@ -1,12 +1,31 @@
 const express = require('express');
 const router = express.Router();
+const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 const Comment = require('./Comment');
 const User = require('./User');
 const Video = require('./Video');
 const Notification = require('./Notification');
-const { auth, isValidId } = require('./lib/auth');
 
-const notify = (data) => { Notification.create(data).catch(err => console.error('notify failed:', err.message)); };
+const auth = (req, res, next) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ msg: 'No token' });
+  try { req.user = jwt.verify(token, process.env.JWT_SECRET); next(); }
+  catch { res.status(401).json({ msg: 'Invalid token' }); }
+};
+
+// Fire-and-forget notification. Wrapped in both sync try and async catch so a
+// malformed payload or hook failure can never bubble back into the caller's
+// response — comments must succeed even if push/notification logging breaks.
+const notify = (data) => {
+  try {
+    Notification.create(data).catch(err => console.error('[notify] create failed:', err && err.message));
+  } catch (err) {
+    console.error('[notify] sync threw:', err && err.message);
+  }
+};
+
+const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
 
 // GET top-level comments for a video (with reply counts) — sorted: pinned first, then newest
 router.get('/:videoId', async (req, res) => {
