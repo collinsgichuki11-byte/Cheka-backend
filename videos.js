@@ -66,26 +66,54 @@ const visibilityFilter = (req) => {
 };
 
 // GET all videos (For You feed) with optional category filter.
-// Uses smart ranking by default; pass ?sort=new for raw recency.
+// - Anonymous viewers ALWAYS get raw reverse-chronological so the feed is
+//   stable for first-time visitors and search engines.
+// - Authenticated viewers get the smart ranker, which mixes engagement,
+//   recency decay, and a personal "interacted with creator before" bonus,
+//   then enforces no-same-creator-in-a-row diversity.
+// - ?sort=new forces recency for any caller (used by the Watch tab toggle).
 router.get('/', optionalAuth, async (req, res) => {
   try {
     const filter = { ...visibilityFilter(req) };
     if (req.query.category) filter.category = req.query.category;
     const limit = Math.min(120, Math.max(20, Number(req.query.limit) || 60));
-    if (req.query.sort === 'new') {
+    const wantsNew = req.query.sort === 'new';
+
+    if (!req.user?.id || wantsNew) {
       const videos = await Video.find(filter).sort({ createdAt: -1 }).limit(limit)
         .populate('creator', POPULATE_CREATOR);
       return res.json(videos.map(decorateVideo));
     }
-    // Pull a recent candidate pool then re-rank in memory.
+
+    // Authed: pull a recent pool then re-rank in memory.
     const pool = await Video.find(filter).sort({ createdAt: -1 }).limit(400)
       .populate('creator', POPULATE_CREATOR);
-    let followedIds = null;
-    if (req.user?.id) {
-      const follows = await Follow.find({ follower: req.user.id }).select('following').lean();
-      followedIds = new Set(follows.map(f => String(f.following)));
+    if (!pool.length) return res.json([]);
+
+    // Build the "interacted creators" set from follows + recent likes/comments.
+    const [follows, recentLikes, recentComments] = await Promise.all([
+      Follow.find({ follower: req.user.id }).select('following').lean(),
+      Video.find({ likedBy: req.user.id }).select('creator').limit(200).lean(),
+      Comment.find({ user: req.user.id }).select('video').limit(200).lean()
+    ]);
+    const interactedCreators = new Set(follows.map(f => String(f.following)));
+    for (const v of recentLikes) interactedCreators.add(String(v.creator));
+    if (recentComments.length) {
+      const vids = await Video.find({ _id: { $in: recentComments.map(c => c.video) } })
+        .select('creator').lean();
+      for (const v of vids) interactedCreators.add(String(v.creator));
     }
-    const ranked = rankVideos(pool, { followedIds });
+
+    // Attach commentCount per video so the ranker can use it.
+    const ids = pool.map(v => v._id);
+    const counts = await Comment.aggregate([
+      { $match: { video: { $in: ids }, parentComment: null } },
+      { $group: { _id: '$video', n: { $sum: 1 } } }
+    ]);
+    const cmap = new Map(counts.map(c => [String(c._id), c.n]));
+    for (const v of pool) v.commentCount = cmap.get(String(v._id)) || 0;
+
+    const ranked = rankVideos(pool, { interactedCreators });
     res.json(ranked.slice(0, limit).map(decorateVideo));
   } catch (err) {
     console.error('GET /videos failed:', err);

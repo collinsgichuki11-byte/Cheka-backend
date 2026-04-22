@@ -4,10 +4,11 @@ const PushSubscription = require('./PushSubscription');
 const { auth } = require('./lib/auth');
 const { publicKey } = require('./lib/pushSender');
 
-// GET /api/push/public-key — clients fetch this to call subscribe()
-router.get('/public-key', (req, res) => {
-  res.json({ key: publicKey() });
-});
+// GET /api/push/vapid-public-key — clients fetch this to call subscribe().
+// /public-key kept as alias for older client builds.
+function sendKey(req, res) { res.json({ key: publicKey() }); }
+router.get('/vapid-public-key', sendKey);
+router.get('/public-key', sendKey);
 
 // POST /api/push/subscribe — register a new push subscription for the user
 router.post('/subscribe', auth, async (req, res) => {

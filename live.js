@@ -34,6 +34,24 @@ router.post('/', auth, async (req, res) => {
       broadcasterName: u?.username || '',
       title: String(req.body?.title || '').slice(0, 120)
     });
+    // Push "X is live now" to every follower (in-app push only — no DB
+    // notification spam since live events are ephemeral).
+    (async () => {
+      try {
+        const { sendToUser } = require('./lib/pushSender');
+        const followers = await Follow.find({ following: req.user.id }).select('follower').lean();
+        const name = u?.displayName || u?.username || 'Someone';
+        const title = `${name} is live now`;
+        const body = stream.title ? stream.title.slice(0, 120) : 'Tap to watch the live stream';
+        const url = `/live-view.html?id=${stream._id}`;
+        await Promise.all(followers.map(f =>
+          sendToUser(f.follower, { title, body, url, tag: 'cheka-live-' + stream._id, type: 'live' })
+            .catch(() => {})
+        ));
+      } catch (err) {
+        console.error('live push fanout failed:', err.message);
+      }
+    })();
     res.json(stream);
   } catch (err) {
     console.error('live create:', err);
