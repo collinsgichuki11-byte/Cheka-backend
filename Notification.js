@@ -29,7 +29,18 @@ NotificationSchema.post('save', function (doc) {
     const body = doc.snippet
       ? doc.snippet.slice(0, 100)
       : (doc.videoTitle ? doc.videoTitle.slice(0, 100) : 'Open Cheka to see more');
-    const url = doc.videoId ? `/feed.html?v=${doc.videoId}` : '/notifications.html';
+    // Route to the most relevant screen for each notification type:
+    //   - follow → the new follower's profile
+    //   - everything else with a videoId → the specific video in the feed
+    //   - fallback → the notifications screen
+    let url;
+    if (doc.type === 'follow' && doc.sender) {
+      url = `/profile.html?u=${encodeURIComponent(doc.sender)}`;
+    } else if (doc.videoId) {
+      url = `/feed.html?v=${doc.videoId}`;
+    } else {
+      url = '/notifications.html';
+    }
     sendToUser(doc.recipient, { title, body, url, type: doc.type, tag: 'cheka-' + doc.type })
       .catch(err => console.error('push fanout failed:', err.message));
   } catch (err) {
