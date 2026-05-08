@@ -31,6 +31,11 @@ const UserSchema = new mongoose.Schema({
   totalEarnings: { type: Number, default: 0 },
   // Community guideline strikes — used by monetization eligibility
   strikes: { type: Number, default: 0 },
+  // Verification
+  verificationStatus: { type: String, enum: ['none', 'pending', 'approved', 'rejected'], default: 'none' },
+  // Referrals
+  referralCode: { type: String, default: null },
+  referralCount: { type: Number, default: 0 },
   createdAt: { type: Date, default: Date.now }
 });
 
